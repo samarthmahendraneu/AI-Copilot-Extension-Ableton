@@ -166,7 +166,7 @@
 
   <textarea
     id="prompt"
-    placeholder="e.g. "Add a bassline that follows these chords" or "Make this more syncopated and add swing""
+    placeholder="e.g. "Add a bassline that follows these chords" — or paste a URL to a pattern/chord reference and I'll read it"
     autofocus
   ></textarea>
 
@@ -213,12 +213,12 @@
     const HINTS = [
       "Add chord extensions (7ths, 9ths)",
       "Make it more syncopated",
-      "Transpose up a 5th",
       "Add a counter-melody",
       "Convert to minor",
       "Humanize the velocities",
       "Generate a 4-bar bassline",
-      "Double the tempo feel",
+      "Recreate the boom-bap pattern from <paste URL>",
+      "Use the chord progression at <paste URL>",
     ];
 
     const hintsEl = document.getElementById("hints");

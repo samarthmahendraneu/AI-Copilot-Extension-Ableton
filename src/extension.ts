@@ -1,10 +1,12 @@
 import * as https from "node:https";
+import * as http from "node:http";
 import {
   initialize,
   MidiClip,
   MidiTrack,
   AudioTrack,
   DrumRack,
+  ClipSlot,
   type ActivationContext,
   type Handle,
   type NoteDescription,
@@ -13,15 +15,90 @@ import {
 import promptUI from "./prompt.html";
 import analysisUI from "./analysis.html";
 
+// ─── Skill knowledge packs (bundled as text via esbuild .md loader) ──────────
+import skillCore   from "./skills/_core.md";
+import skillDrums  from "./skills/drums.md";
+import skillHipHop from "./skills/hiphop.md";
+import skillHouse  from "./skills/house.md";
+import skillMelody from "./skills/melody.md";
+import skillBass   from "./skills/bass.md";
+
 const MODEL = "gpt-5.2";
+
+// ─── Skill registry & selector ────────────────────────────────────────────────
+// Skills are externalized musical knowledge. The selector picks which skills to
+// inject based on (a) the track's role and (b) keywords in the user's prompt.
+// _core is ALWAYS loaded. This keeps each prompt focused instead of dumping
+// every rule into one giant system message.
+
+interface Skill {
+  id:       string;
+  content:  string;
+  keywords: RegExp; // matched against the user prompt to auto-include
+}
+
+const SKILLS: Skill[] = [
+  { id: "drums",  content: skillDrums,  keywords: /drum|beat|kick|snare|hat|hi-?hat|percussion|groove|fill|808|clap/i },
+  { id: "hiphop", content: skillHipHop, keywords: /hip.?hop|boom.?bap|trap|lo.?fi|lofi|rap|drill|j.?dilla|mpc/i },
+  { id: "house",  content: skillHouse,  keywords: /house|techno|four.?on.?the.?floor|deep house|tech house|edm|dance|club|rave/i },
+  { id: "melody", content: skillMelody, keywords: /melod|lead|hook|topline|riff|chord|harmon|progression|counter|arp/i },
+  { id: "bass",   content: skillBass,   keywords: /bass|808|sub|low.?end|bassline/i },
+];
+
+type TrackRole = "drums" | "bass" | "chords" | "melody" | "unknown";
+
+/** Infer a track's musical role from its name (for skill selection). */
+function inferTrackRole(trackName: string, isDrum: boolean): TrackRole {
+  if (isDrum) return "drums";
+  const n = trackName.toLowerCase();
+  if (/bass|808|sub/.test(n))                              return "bass";
+  if (/chord|pad|keys|piano|organ|rhodes|stab/.test(n))    return "chords";
+  if (/lead|melody|hook|top|arp|riff|pluck|synth/.test(n)) return "melody";
+  return "unknown";
+}
+
+/**
+ * Select and concatenate the relevant skill packs for this generation.
+ * _core is always included. Role-based + keyword-based skills are added.
+ */
+function selectSkills(opts: { role: TrackRole; prompt: string }): string {
+  const chosen = new Set<string>();
+
+  // Role always pulls its matching skill
+  if (opts.role === "drums")  chosen.add("drums");
+  if (opts.role === "bass")   chosen.add("bass");
+  if (opts.role === "melody") chosen.add("melody");
+  if (opts.role === "chords") chosen.add("melody"); // chords use the melody/harmony skill
+
+  // Keyword matches from the prompt (e.g. "trap beat" → hiphop + drums)
+  for (const skill of SKILLS) {
+    if (skill.keywords.test(opts.prompt)) chosen.add(skill.id);
+  }
+
+  // Assemble: _core first, then the selected packs in a stable order
+  const order = ["drums", "bass", "melody", "hiphop", "house"];
+  const parts = [skillCore];
+  for (const id of order) {
+    if (chosen.has(id)) {
+      const s = SKILLS.find((x) => x.id === id);
+      if (s) parts.push(s.content);
+    }
+  }
+
+  return parts.join("\n\n───────────────────────────────────────────\n\n");
+}
 
 // ─── Lightweight OpenAI HTTPS client ─────────────────────────────────────────
 
-type Role = "system" | "user" | "assistant";
+type Role = "system" | "user" | "assistant" | "tool";
 
 interface Message {
   role: Role;
-  content: string;
+  content: string | null;
+  // assistant messages may carry tool calls; tool messages carry their id
+  tool_calls?: ToolCall[];
+  tool_call_id?: string;
+  name?: string;
 }
 
 interface ToolDef {
@@ -99,6 +176,207 @@ function chatCompletion(opts: {
   });
 }
 
+// ─── Web access: fetch a URL and return readable text ─────────────────────────
+// Uses node:http / node:https directly (the Extension Host sandbox has no fetch).
+// Follows redirects, caps size, strips HTML to plain text so the model gets
+// readable content instead of markup.
+
+const MAX_FETCH_BYTES = 200_000; // ~200KB cap so we don't blow the context window
+
+function stripHtmlToText(html: string): string {
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<!--[\s\S]*?-->/g, " ")
+    .replace(/<\/(p|div|br|li|tr|h[1-6])>/gi, "\n")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function httpGetText(url: string, redirectsLeft = 4): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let parsed: URL;
+    try {
+      parsed = new URL(url);
+    } catch {
+      return reject(new Error(`Invalid URL: ${url}`));
+    }
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return reject(new Error(`Only http/https URLs are allowed (got ${parsed.protocol})`));
+    }
+
+    const client = parsed.protocol === "https:" ? https : http;
+    const req = client.request(
+      {
+        hostname: parsed.hostname,
+        port:     parsed.port || (parsed.protocol === "https:" ? 443 : 80),
+        path:     parsed.pathname + parsed.search,
+        method:   "GET",
+        headers: {
+          "User-Agent": "AI-Copilot-Ableton/1.0 (+https://github.com)",
+          "Accept": "text/html,application/xhtml+xml,application/json,text/plain;q=0.9,*/*;q=0.8",
+        },
+        timeout: 15_000,
+      },
+      (res) => {
+        const status = res.statusCode ?? 0;
+
+        // Follow redirects
+        if (status >= 300 && status < 400 && res.headers.location) {
+          res.resume(); // drain
+          if (redirectsLeft <= 0) return reject(new Error("Too many redirects"));
+          const next = new URL(res.headers.location, url).toString();
+          return resolve(httpGetText(next, redirectsLeft - 1));
+        }
+        if (status >= 400) {
+          res.resume();
+          return reject(new Error(`HTTP ${status} fetching ${url}`));
+        }
+
+        const contentType = String(res.headers["content-type"] ?? "");
+        let raw = "";
+        let bytes = 0;
+        res.on("data", (chunk: Buffer) => {
+          bytes += chunk.length;
+          if (bytes <= MAX_FETCH_BYTES) raw += chunk.toString("utf8");
+          else res.destroy(); // stop reading once we hit the cap
+        });
+        res.on("end", () => {
+          const isHtml = /text\/html|application\/xhtml/i.test(contentType);
+          const text = isHtml ? stripHtmlToText(raw) : raw;
+          const capped = text.length > MAX_FETCH_BYTES ? text.slice(0, MAX_FETCH_BYTES) : text;
+          resolve(capped || "(empty response)");
+        });
+        res.on("close", () => {
+          if (bytes > MAX_FETCH_BYTES && raw) {
+            const isHtml = /text\/html|application\/xhtml/i.test(contentType);
+            resolve((isHtml ? stripHtmlToText(raw) : raw).slice(0, MAX_FETCH_BYTES));
+          }
+        });
+      },
+    );
+
+    req.on("timeout", () => { req.destroy(); reject(new Error(`Timeout fetching ${url}`)); });
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+// The tool the model calls to read a web page during generation.
+const FETCH_URL_TOOL: ToolDef = {
+  type: "function",
+  function: {
+    name: "fetch_url",
+    description:
+      "Fetch a web page or API endpoint and return its readable text content. " +
+      "Use this to research drum patterns, chord progressions, scales, genre conventions, " +
+      "or any musical reference the user points you to. HTML is stripped to plain text. " +
+      "Call this BEFORE generating notes if a URL or online reference is relevant, then apply what you learned.",
+    strict: true,
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      required: ["url", "reason"],
+      properties: {
+        url:    { type: "string", description: "Full http(s) URL to fetch." },
+        reason: { type: "string", description: "Why you are fetching this (what you hope to learn)." },
+      },
+    },
+  },
+};
+
+/**
+ * Agentic chat loop. Adds fetch_url to the toolset and resolves any fetch_url
+ * calls locally, feeding results back to the model, until the model either:
+ *   - calls one of the "terminal" generation tools (set_notes, set_drum_pattern…), or
+ *   - returns with no tool call.
+ * Returns the final assistant message (with its terminal tool_calls).
+ *
+ * `onProgress` lets the caller surface "Reading <url>…" in the progress dialog.
+ */
+async function runGeneration(opts: {
+  messages: Message[];
+  tools: ToolDef[];               // the terminal generation tools
+  tool_choice?: "auto" | "required" | "none";
+  allowWeb?: boolean;             // include fetch_url in the toolset
+  maxWebFetches?: number;         // safety cap on number of fetches
+  onProgress?: (label: string) => void;
+}): Promise<ChatResponse> {
+  const terminalNames = new Set(opts.tools.map((t) => t.function.name));
+  const tools = opts.allowWeb ? [...opts.tools, FETCH_URL_TOOL] : opts.tools;
+  const messages: Message[] = [...opts.messages];
+
+  const maxFetches = opts.maxWebFetches ?? 6;
+  let fetches = 0;
+
+  // Up to (maxFetches + 2) round-trips so the model can browse then generate.
+  for (let iter = 0; iter < maxFetches + 2; iter++) {
+    // While the model is still browsing we must allow it to NOT call a terminal
+    // tool, so only force tool_choice once web is disabled or fetches exhausted.
+    const choice =
+      opts.allowWeb && fetches < maxFetches ? "auto" : (opts.tool_choice ?? "required");
+
+    const response = await chatCompletion({ messages, tools, tool_choice: choice });
+    const msg = response.choices[0]?.message;
+    const calls = msg?.tool_calls ?? [];
+
+    const fetchCalls    = calls.filter((c) => c.function.name === "fetch_url");
+    const terminalCalls = calls.filter((c) => terminalNames.has(c.function.name));
+
+    // If the model produced a terminal generation call, we're done.
+    if (terminalCalls.length > 0) return response;
+
+    // If it asked to fetch URLs, resolve them and loop.
+    if (fetchCalls.length > 0 && fetches < maxFetches) {
+      // Record the assistant message that requested the tools
+      messages.push({ role: "assistant", content: msg?.content ?? null, tool_calls: calls });
+
+      for (const call of fetchCalls) {
+        if (fetches >= maxFetches) break;
+        fetches++;
+        let url = "";
+        try {
+          const args = JSON.parse(call.function.arguments) as { url: string; reason?: string };
+          url = args.url;
+          opts.onProgress?.(`Reading ${new URL(url).hostname}…`);
+          const text = await httpGetText(url);
+          const trimmed = text.length > 12_000 ? text.slice(0, 12_000) + "\n…(truncated)" : text;
+          messages.push({
+            role: "tool",
+            tool_call_id: call.id,
+            name: "fetch_url",
+            content: `Fetched ${url}:\n\n${trimmed}`,
+          });
+          console.log(`[AI Copilot] fetch_url → ${url} (${text.length} chars)`);
+        } catch (e) {
+          messages.push({
+            role: "tool",
+            tool_call_id: call.id,
+            name: "fetch_url",
+            content: `Failed to fetch ${url}: ${(e as Error).message}`,
+          });
+          console.warn(`[AI Copilot] fetch_url failed: ${url} — ${(e as Error).message}`);
+        }
+      }
+      continue; // ask the model again now that it has the page content
+    }
+
+    // No terminal call and no fetch — return whatever we got (caller handles empty).
+    return response;
+  }
+
+  // Exhausted iterations: force one final generation pass with web disabled.
+  return chatCompletion({ messages, tools: opts.tools, tool_choice: opts.tool_choice ?? "required" });
+}
+
 // ─── Drum helpers ─────────────────────────────────────────────────────────────
 
 const GM_DRUM_MAP = `
@@ -126,7 +404,7 @@ interface DrumPatternResult {
 
 /** True if the track has a DrumRack device loaded */
 function isDrumTrack(track: MidiTrack<"1.0.0">): boolean {
-  return track.devices.some((d) => d.className === "DrumRack");
+  return track.devices.some((d) => d instanceof DrumRack);
 }
 
 /**
@@ -140,7 +418,7 @@ function isDrumTrack(track: MidiTrack<"1.0.0">): boolean {
  * Falls back to the generic GM map if no DrumRack is found.
  */
 function readDrumPadMap(track: MidiTrack<"1.0.0">): string {
-  const drumRack = track.devices.find((d) => d.className === "DrumRack");
+  const drumRack = track.devices.find((d) => d instanceof DrumRack);
   if (!(drumRack instanceof DrumRack) || drumRack.chains.length === 0) {
     return GM_DRUM_MAP; // fallback
   }
@@ -155,7 +433,8 @@ function readDrumPadMap(track: MidiTrack<"1.0.0">): string {
   for (const chain of sorted) {
     const note  = chain.receivingNote;
     const name  = pitchToName(note);
-    const label = chain.name.trim() || "(unnamed pad)";
+    // chain.name can be undefined for empty/unnamed pads — guard it.
+    const label = (chain.name ?? "").trim() || "(unnamed pad)";
     lines.push(`  ${note.toString().padStart(3)} (${name.padEnd(4)}) = ${label}`);
   }
 
@@ -178,14 +457,30 @@ function expandDrumPattern(
 
   for (let bar = 0; bar < totalBars; bar++) {
     const variation = result.variation_bars.find((v) => v.bar_index === bar);
-    const hits      = variation ? variation.hits : result.base_pattern.hits;
 
+    // ── ADDITIVE: base_pattern always plays. variation_bars ADD extra hits on top.
+    // This guarantees kick and snare never drift — they always come from base_pattern.
+    // variation_bars are only for fills, crashes, and accents — never replacements.
+    const hits = variation
+      ? [...result.base_pattern.hits, ...variation.hits]
+      : result.base_pattern.hits;
+
+    // Deduplicate: if variation adds a hit at the same pitch+beat as base, keep
+    // the variation's velocity (it's intentional) and drop the base duplicate.
+    const seen = new Map<string, DrumHit>();
     for (const hit of hits) {
+      const key = `${Math.round(hit.pitch)}_${hit.beat.toFixed(3)}`;
+      if (!seen.has(key) || seen.get(key)!.velocity < hit.velocity) {
+        seen.set(key, hit);
+      }
+    }
+
+    for (const hit of seen.values()) {
       const clampedBeat = Math.max(0, Math.min(3.99, hit.beat));
       notes.push({
         pitch:     Math.round(hit.pitch),
         startTime: bar * 4 + clampedBeat,
-        duration:  0.125, // drums are percussive — always short
+        duration:  0.125, // drums are always percussive — short duration
         velocity:  Math.max(1, Math.min(127, Math.round(hit.velocity))),
         muted:     false,
       });
@@ -201,9 +496,10 @@ const SET_DRUM_PATTERN_TOOL: ToolDef = {
     name: "set_drum_pattern",
     description:
       "Set a drum pattern using a bar-repeating structure. " +
-      "You define ONE base bar, and it is mechanically cloned across every bar of the clip. " +
-      "This guarantees kick/snare consistency — the code, not you, handles repetition. " +
-      "Only override specific bars via variation_bars (fills, crashes, breakdowns).",
+      "You define ONE base bar (base_pattern) — it plays on EVERY bar, no exceptions. " +
+      "variation_bars are ADDITIVE: they ADD extra hits on top of the base pattern for specific bars. " +
+      "The base kick and snare always play — variation_bars only add fills, crashes, or accents. " +
+      "NEVER put kick/snare in variation_bars thinking they will replace the base — they won't, they stack.",
     strict: true,
     parameters: {
       type: "object",
@@ -235,8 +531,10 @@ const SET_DRUM_PATTERN_TOOL: ToolDef = {
         variation_bars: {
           type: "array",
           description:
-            "Optional per-bar overrides — e.g. bar index 3 (4th bar) with a snare fill or crash. " +
-            "Use 0-based bar index. Leave empty [] if no variations needed.",
+            "ADDITIVE extra hits for specific bars — stacked ON TOP of base_pattern, not replacing it. " +
+            "Use for: crash on bar 1, snare rolls on bar 4, extra kick on breakdown bar. " +
+            "The base kick and snare always play from base_pattern — do NOT re-add them here. " +
+            "0-based bar index. Leave empty [] if no fills needed.",
           items: {
             type: "object",
             additionalProperties: false,
@@ -398,11 +696,157 @@ function enforceGaps(
   return result;
 }
 
+// ─── LAYER 3: Deterministic validators ────────────────────────────────────────
+// These run AFTER the AI returns notes. They GUARANTEE musical rules in code,
+// so reliability never depends on the model "remembering" to obey a prompt.
+
+/** Return the set of in-key pitch classes (0–11), or null if Scale Mode is off. */
+function getScalePitchClasses(
+  song: ReturnType<typeof initialize>["application"]["song"] & object,
+): Set<number> | null {
+  if (!song.scaleMode || !song.scaleName) return null;
+  const root      = song.rootNote ?? 0;
+  const intervals = song.scaleIntervals ?? [0, 2, 4, 5, 7, 9, 11];
+  return new Set(intervals.map((i) => (root + i) % 12));
+}
+
+/**
+ * Snap every out-of-key note to the nearest in-key pitch.
+ * No-op if Scale Mode is off. Preserves octave register where possible.
+ */
+function snapToScale(notes: NoteDescription[], allowed: Set<number> | null): NoteDescription[] {
+  if (!allowed || allowed.size === 0) return notes;
+
+  return notes.map((n) => {
+    const pc = ((n.pitch % 12) + 12) % 12;
+    if (allowed.has(pc)) return n;
+
+    // Search outward for the nearest allowed pitch class (±6 semitones max)
+    for (let dist = 1; dist <= 6; dist++) {
+      if (allowed.has((pc + dist) % 12))      return { ...n, pitch: n.pitch + dist };
+      if (allowed.has((pc - dist + 12) % 12)) return { ...n, pitch: n.pitch - dist };
+    }
+    return n; // unreachable for any real scale
+  });
+}
+
+/**
+ * Guarantee no two time-adjacent notes share an identical velocity, and clamp
+ * to a musical range. Robotic flat-velocity output is the #1 "AI smell".
+ */
+function humanizeVelocities(
+  notes: NoteDescription[],
+  range: [number, number] = [55, 115],
+): NoteDescription[] {
+  const sorted = [...notes].sort((a, b) => a.startTime - b.startTime);
+  let prevVel = -1;
+
+  return sorted.map((n) => {
+    let vel = Math.max(range[0], Math.min(range[1], n.velocity ?? 90));
+    if (vel === prevVel) {
+      // Nudge by a small pseudo-random amount, staying in range
+      const nudge = ((Math.round(n.startTime * 1000) % 7) - 3); // -3..+3, deterministic
+      vel = Math.max(range[0], Math.min(range[1], vel + (nudge === 0 ? 4 : nudge)));
+    }
+    prevVel = vel;
+    return { ...n, velocity: vel };
+  });
+}
+
+/**
+ * Cap notes-per-bar for melodic parts. If a bar exceeds maxPerBar, keep the
+ * loudest / structurally important notes and drop the weakest. Prevents the
+ * "wall of notes" failure mode.
+ */
+function clampMelodyDensity(notes: NoteDescription[], maxPerBar = 8): NoteDescription[] {
+  const byBar = new Map<number, NoteDescription[]>();
+  for (const n of notes) {
+    const bar = Math.floor(n.startTime / 4);
+    (byBar.get(bar) ?? byBar.set(bar, []).get(bar)!).push(n);
+  }
+
+  const kept: NoteDescription[] = [];
+  for (const barNotes of byBar.values()) {
+    if (barNotes.length <= maxPerBar) {
+      kept.push(...barNotes);
+      continue;
+    }
+    // Keep the most prominent: prioritise downbeat notes and high velocity
+    const ranked = [...barNotes].sort((a, b) => {
+      const aDown = (a.startTime % 1) === 0 ? 1000 : 0;
+      const bDown = (b.startTime % 1) === 0 ? 1000 : 0;
+      return (bDown + (b.velocity ?? 0)) - (aDown + (a.velocity ?? 0));
+    });
+    kept.push(...ranked.slice(0, maxPerBar));
+  }
+  return kept.sort((a, b) => a.startTime - b.startTime);
+}
+
+/**
+ * Full melody/bass validation pipeline. Order matters:
+ *   1. density clamp  2. scale snap  3. gap enforce  4. velocity humanize
+ * Returns the cleaned notes plus a report of what was changed (for logging).
+ */
+function runMelodyValidators(
+  rawNotes: NoteDescription[],
+  song: ReturnType<typeof initialize>["application"]["song"] & object,
+  opts: { maxPerBar?: number; velRange?: [number, number]; minGap?: number } = {},
+): { notes: NoteDescription[]; report: string } {
+  const allowed = getScalePitchClasses(song);
+  const before  = rawNotes.length;
+
+  let notes = clampMelodyDensity(rawNotes, opts.maxPerBar ?? 8);
+  const afterDensity = notes.length;
+
+  let outOfKey = 0;
+  if (allowed) {
+    outOfKey = notes.filter((n) => !allowed.has(((n.pitch % 12) + 12) % 12)).length;
+    notes = snapToScale(notes, allowed);
+  }
+
+  notes = enforceGaps(notes, opts.minGap ?? 0.125);
+  notes = humanizeVelocities(notes, opts.velRange ?? [55, 115]);
+
+  const report =
+    `validators: ${before} notes → ${notes.length} ` +
+    `(density-dropped ${before - afterDensity}, scale-snapped ${outOfKey}, ` +
+    `humanized velocities, gaps enforced)`;
+
+  return { notes, report };
+}
+
+// ─── Clip color coding ────────────────────────────────────────────────────────
+// Returns an RGB integer (0xRRGGBB) based on track role.
+// Ableton stores clip colors as packed RGB: (R << 16) | (G << 8) | B.
+
+const CLIP_COLORS = {
+  drums:   0xFF8C00, // orange   — kick, snare, hi-hats
+  bass:    0x0F6FFF, // blue     — bass, 808, sub
+  chords:  0xAA44FF, // purple   — chords, pads, keys
+  melody:  0x00C264, // green    — lead, melody, hook
+  default: 0xFF8C00, // orange   — fallback
+} as const;
+
+function clipColorForTrack(trackName: string, isDrum: boolean): number {
+  if (isDrum) return CLIP_COLORS.drums;
+
+  const n = trackName.toLowerCase();
+
+  if (/bass|808|sub/.test(n))                          return CLIP_COLORS.bass;
+  if (/chord|pad|keys|piano|organ|rhodes|synth/.test(n)) return CLIP_COLORS.chords;
+  if (/lead|melody|hook|top|arp|riff/.test(n))         return CLIP_COLORS.melody;
+
+  return CLIP_COLORS.default;
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function pitchToName(midi: number): string {
+  // Ableton Live convention: middle C = C3 = MIDI 60 (octave = floor(midi/12) - 2).
+  // This MUST match Live's note display, otherwise the drum pad map shows the AI
+  // the wrong octave (e.g. labeling kick MIDI 36 as "C2" when Live shows "C1").
   const names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
-  return `${names[midi % 12]}${Math.floor(midi / 12) - 1}`;
+  return `${names[midi % 12]}${Math.floor(midi / 12) - 2}`;
 }
 
 function notesToSummary(notes: NoteDescription[], maxNotes = 64): string {
@@ -538,6 +982,178 @@ function buildSessionContext(
   return lines.join("\n");
 }
 
+// ─── Sibling context builder ──────────────────────────────────────────────────
+// Shows content of ALL OTHER tracks (MIDI + Audio) in the same arrangement
+// region so the AI can lock to / complement what's already playing.
+// targetTrackName is excluded so the AI doesn't echo the target back.
+
+function buildSiblingContext(
+  song: ReturnType<typeof initialize>["application"]["song"] & object,
+  targetTrackName: string,
+  regionStart: number, // beats
+  regionEnd:   number, // beats
+): string {
+  const regionBars = Math.round((regionEnd - regionStart) / 4);
+  const lines: string[] = [
+    "╔══ EXISTING CONTENT ON OTHER TRACKS (arrangement + session) ══",
+    `║  Arrangement region scanned: beat ${regionStart}–${regionEnd}  (${regionBars} bars)`,
+    `║  Session View clips on other tracks are also shown below.`,
+    `║  Your output MUST lock to / complement these parts.`,
+    "╠══════════════════════════════════════════════════════════",
+  ];
+
+  let hasAny = false;
+
+  for (const track of song.tracks) {
+    if (track.name === targetTrackName) continue;
+
+    // Find clips that overlap this region
+    const overlapping = track.arrangementClips.filter(
+      (c) => c.startTime < regionEnd && (c.startTime + c.duration) > regionStart,
+    );
+    if (overlapping.length === 0) continue;
+
+    // ── Audio track ────────────────────────────────────────────────────────
+    if (track instanceof AudioTrack) {
+      lines.push(`║`);
+      lines.push(`║  [Audio] "${track.name}"`);
+      hasAny = true;
+
+      for (const clip of overlapping) {
+        // Extract just the filename from the full path for readability
+        const fileName = clip instanceof MidiClip
+          ? clip.name
+          : (() => {
+              const fp = (clip as { filePath?: string }).filePath ?? "";
+              return (fp.split("/").pop() ?? fp.split("\\").pop() ?? fp) || clip.name;
+            })();
+
+        const clipStartInRegion = clip.startTime - regionStart;
+        const clipBar  = Math.floor(clip.startTime / 4) + 1;
+        const clipBars = Math.round(clip.duration / 4);
+
+        lines.push(`║    Clip: "${clip.name}"`);
+        lines.push(`║      File:     ${fileName}`);
+        lines.push(`║      Position: bar ${clipBar}  (beat ${clip.startTime.toFixed(1)} in arrangement)`);
+        lines.push(`║      Length:   ${clip.duration.toFixed(1)} beats  (${clipBars} bars)`);
+        lines.push(`║      Looping:  ${clip.looping ? "yes" : "no"}${clip.muted ? "  [MUTED]" : ""}`);
+        lines.push(`║      → This audio occupies beats ${clipStartInRegion.toFixed(1)}–${(clipStartInRegion + clip.duration).toFixed(1)} of this region.`);
+        lines.push(`║        Infer its rhythmic and harmonic role from the track name + filename.`);
+      }
+      continue;
+    }
+
+    // ── MIDI track ─────────────────────────────────────────────────────────
+    if (!(track instanceof MidiTrack)) continue;
+
+    const isDrum = isDrumTrack(track);
+
+    // Render a single MIDI clip's notes. `offsetBeats` shifts note times so they
+    // read relative to the region; for session clips it's 0 (their own beat 0).
+    const renderMidiClip = (clip: MidiClip<"1.0.0">, offsetBeats: number, sourceLabel: string) => {
+      const regionNotes = clip.notes
+        .map((n) => ({ ...n, startTime: n.startTime + offsetBeats }))
+        .filter((n) => n.startTime >= 0 && n.startTime < Math.max(regionEnd - regionStart, clip.duration))
+        .sort((a, b) => a.startTime - b.startTime);
+      if (regionNotes.length === 0) return;
+
+      hasAny = true;
+      lines.push(`║`);
+      lines.push(`║  [${isDrum ? "Drums" : "MIDI"}] "${track.name}"  (${sourceLabel})`);
+      lines.push(`║    Clip: "${clip.name}"  (${regionNotes.length} notes)`);
+
+      const spanBars = Math.max(1, Math.round(clip.duration / 4));
+
+      if (isDrum) {
+        for (let bar = 0; bar < Math.min(spanBars, 4); bar++) {
+          const barNotes = regionNotes.filter(
+            (n) => n.startTime >= bar * 4 && n.startTime < (bar + 1) * 4,
+          );
+          const grid = Array(16).fill("·");
+          for (const n of barNotes) {
+            const slot = Math.round(((n.startTime % 4) / 4) * 16);
+            const label = pitchToName(n.pitch)[0] ?? "X";
+            if (slot >= 0 && slot < 16) grid[slot] = label.toUpperCase();
+          }
+          lines.push(
+            `║      Bar ${bar + 1}: [${grid.join("")}]  ← ` +
+            barNotes.map((n) => `${pitchToName(n.pitch)}@${n.startTime.toFixed(2)}`).slice(0, 8).join(" "),
+          );
+        }
+      } else {
+        const shown = regionNotes.slice(0, 32);
+        lines.push(
+          `║      Notes: ` +
+          shown.map((n) => `${pitchToName(n.pitch)}@${n.startTime.toFixed(2)}(${n.duration.toFixed(2)})`).join("  "),
+        );
+        if (regionNotes.length > 32) lines.push(`║      … +${regionNotes.length - 32} more`);
+
+        const busyBeats = new Set(shown.map((n) => Math.floor(n.startTime)));
+        const beatGrid = Array.from({ length: Math.min(spanBars * 4, 16) }, (_, i) =>
+          busyBeats.has(i) ? "█" : "·",
+        );
+        lines.push(`║      Beat activity: [${beatGrid.join("")}]  (█=notes ·=empty)`);
+      }
+    };
+
+    // 1) Arrangement clips overlapping the region
+    for (const clip of overlapping) {
+      if (clip instanceof MidiClip && clip.notes.length > 0) {
+        renderMidiClip(clip, clip.startTime - regionStart, "arrangement");
+      }
+    }
+  }
+
+  // ── Second pass: Session View clips (clip slots) ──────────────────────────
+  // The arrangement loop above misses clips that live only in Session View.
+  // We scan every other MIDI track's clip slots so a bass/chord clip loaded in
+  // Session View is still visible to the generator.
+  for (const track of song.tracks) {
+    if (track.name === targetTrackName) continue;
+    if (!(track instanceof MidiTrack)) continue;
+
+    const isDrum = isDrumTrack(track);
+    const sessionClips = track.clipSlots
+      .map((cs) => cs.clip)
+      .filter((c): c is MidiClip<"1.0.0"> => c instanceof MidiClip && c.notes.length > 0);
+
+    for (const clip of sessionClips) {
+      const sorted = [...clip.notes].sort((a, b) => a.startTime - b.startTime);
+      hasAny = true;
+      lines.push(`║`);
+      lines.push(`║  [${isDrum ? "Drums" : "MIDI"}] "${track.name}"  (session view)`);
+      lines.push(`║    Clip: "${clip.name}"  (${sorted.length} notes, ${(clip.duration / 4).toFixed(1)} bars)`);
+
+      if (isDrum) {
+        const spanBars = Math.max(1, Math.round(clip.duration / 4));
+        for (let bar = 0; bar < Math.min(spanBars, 4); bar++) {
+          const barNotes = sorted.filter((n) => n.startTime >= bar * 4 && n.startTime < (bar + 1) * 4);
+          const grid = Array(16).fill("·");
+          for (const n of barNotes) {
+            const slot = Math.round(((n.startTime % 4) / 4) * 16);
+            grid[slot] = (pitchToName(n.pitch)[0] ?? "X").toUpperCase();
+          }
+          lines.push(`║      Bar ${bar + 1}: [${grid.join("")}]`);
+        }
+      } else {
+        const shown = sorted.slice(0, 32);
+        lines.push(
+          `║      Notes: ` +
+          shown.map((n) => `${pitchToName(n.pitch)}@${n.startTime.toFixed(2)}(${n.duration.toFixed(2)})`).join("  "),
+        );
+        if (sorted.length > 32) lines.push(`║      … +${sorted.length - 32} more`);
+      }
+    }
+  }
+
+  if (!hasAny) {
+    lines.push("║  (No existing content found in arrangement OR session view — starting fresh)");
+  }
+
+  lines.push("╚══════════════════════════════════════════════════════════");
+  return lines.join("\n");
+}
+
 // ─── Command: Edit existing MIDI clip ─────────────────────────────────────────
 
 async function editClipCommand(
@@ -568,13 +1184,24 @@ async function editClipCommand(
     ) as MidiTrack<"1.0.0"> | undefined;
     const drumMode = parentTrack ? isDrumTrack(parentTrack) : false;
 
+    // Build sibling context: what other tracks are playing in this same region
+    const siblingCtx = buildSiblingContext(
+      song,
+      parentTrack?.name ?? "",
+      clip.startTime,
+      clip.startTime + clip.duration,
+    );
+
     update("Thinking…", 30);
 
     // ── Drum mode: bar-repeating pattern tool ──────────────────────────────
     if (drumMode) {
       const currentPitches = [...new Set(currentNotes.map((n) => pitchToName(n.pitch)))].join(" ");
+      const skills = selectSkills({ role: "drums", prompt });
 
-      const response = await chatCompletion({
+      const response = await runGeneration({
+        allowWeb: true,
+        onProgress: (l) => update(l, 45),
         messages: [
           {
             role: "system",
@@ -584,6 +1211,15 @@ async function editClipCommand(
               "This guarantees consistency — kicks and snares will be in the same position every bar.",
               "Only use variation_bars for fills (typically the last bar of a 4-bar phrase) or crashes.",
               "",
+              "CRITICAL: Read the existing arrangement content below BEFORE writing any pattern.",
+              "If a bass line exists, lock the kick drum to its root note hits.",
+              "If a melody exists, leave breathing room — don't clutter every 16th note.",
+              "Your drums must GROOVE WITH what's already there, not ignore it.",
+              "",
+              "═══ PRODUCTION KNOWLEDGE (read and apply these skills) ═══",
+              skills,
+              "═════════════════════════════════════════════════════════",
+              "",
               parentTrack ? readDrumPadMap(parentTrack) : GM_DRUM_MAP,
             ].join("\n"),
           },
@@ -591,6 +1227,8 @@ async function editClipCommand(
             role: "user",
             content: [
               sessionCtx,
+              "",
+              siblingCtx,
               "",
               "╔══ TARGET DRUM CLIP ══════════════════════════════════════",
               `║  Name:        "${clip.name}"`,
@@ -625,6 +1263,7 @@ async function editClipCommand(
           if (call.function.name === "set_drum_pattern") {
             const result   = args as DrumPatternResult;
             clip.notes     = expandDrumPattern(result, clip.duration);
+            clip.color     = CLIP_COLORS.drums;
             console.log(
               `[AI Copilot] set_drum_pattern → ${clip.notes.length} notes across ${totalBars} bars.\n` +
               `  Base hits: ${result.base_pattern.hits.length}  Variation bars: ${result.variation_bars.length}\n` +
@@ -641,8 +1280,12 @@ async function editClipCommand(
     // ── Melody / chord / bass mode: standard notes tool ───────────────────
     } else {
       const scaleConstraint = buildScaleConstraint(song);
+      const role   = inferTrackRole(parentTrack?.name ?? "", false);
+      const skills = selectSkills({ role, prompt });
 
-      const response = await chatCompletion({
+      const response = await runGeneration({
+        allowWeb: true,
+        onProgress: (l) => update(l, 45),
         messages: [
           {
             role: "system",
@@ -652,6 +1295,16 @@ async function editClipCommand(
               "When generating or editing a melody clip, you MUST follow the phrasing rules below.",
               "When editing chords or bass, follow normal production rules.",
               "",
+              "CRITICAL: Read the existing arrangement content shown below BEFORE writing notes.",
+              "If drums exist: fit your rhythm AROUND the kick and snare — don't clash on every beat.",
+              "If a bassline exists: your melody must complement its harmonic movement, not copy it.",
+              "If a melody exists and you are writing bass: lock your bass root notes to the kick hits.",
+              "Study the beat grid / note positions carefully and write something that LOCKS IN.",
+              "",
+              "═══ PRODUCTION KNOWLEDGE (read and apply these skills) ═══",
+              skills,
+              "═════════════════════════════════════════════════════════",
+              "",
               MELODY_RULES,
               scaleConstraint,
             ].join("\n"),
@@ -660,6 +1313,8 @@ async function editClipCommand(
             role: "user",
             content: [
               sessionCtx,
+              "",
+              siblingCtx,
               scaleConstraint,
               "",
               "╔══ TARGET CLIP (the one to edit) ═════════════════════════",
@@ -675,8 +1330,8 @@ async function editClipCommand(
               "",
               `USER REQUEST: "${prompt}"`,
               "",
-              "Fit this musically into the session above. If it is a melody, strictly follow " +
-              "the phrasing rules — write phrase_plan first, then generate sparse, breathing notes.",
+              "Study the existing content above first, then fit your output to it. " +
+              "Write phrase_plan first, then generate sparse notes that groove with what's already there.",
             ].join("\n"),
           },
         ],
@@ -693,10 +1348,13 @@ async function editClipCommand(
           const args = JSON.parse(call.function.arguments);
           if (call.function.name === "set_notes") {
             const rawNotes = args.notes as NoteDescription[];
-            const gapped   = enforceGaps(rawNotes, 0.125);
-            clip.notes     = gapped;
+            const { notes, report } = runMelodyValidators(rawNotes, song, {
+              maxPerBar: role === "chords" ? 16 : role === "bass" ? 10 : 8,
+            });
+            clip.notes = notes;
+            clip.color = clipColorForTrack(parentTrack?.name ?? "", false);
             console.log(
-              `[AI Copilot] set_notes → ${rawNotes.length} notes (${rawNotes.length - gapped.length} gap-trimmed).\n` +
+              `[AI Copilot] set_notes → ${report}\n` +
               `  Phrase plan: ${String(args.phrase_plan)}\n  Reasoning: ${String(args.reasoning)}`,
             );
           }
@@ -735,6 +1393,15 @@ async function generateClipCommand(
     const sessionCtx = buildSessionContext(song);
     const drumMode   = isDrumTrack(track);
 
+    // For a new clip we default to placing at beat 0 for 16 beats (4 bars) —
+    // the AI may override startTime in its tool call. Use that range for sibling context.
+    const existingEnd = track.arrangementClips.reduce(
+      (max, c) => Math.max(max, c.startTime + c.duration), 0,
+    );
+    const guessStart = 0;
+    const guessEnd   = Math.max(existingEnd, 16);
+    const siblingCtx = buildSiblingContext(song, track.name, guessStart, guessEnd);
+
     update("Thinking…", 30);
 
     // ── Drum track: bar-repeating pattern ─────────────────────────────────
@@ -744,9 +1411,10 @@ async function generateClipCommand(
         function: {
           name: "create_drum_clip",
           description:
-            "Create a new drum clip on the track using a bar-repeating pattern. " +
-            "Define ONE base bar — the code repeats it across all bars. " +
-            "Use variation_bars only for fills or crashes.",
+            "Create a new drum clip using a bar-repeating pattern. " +
+            "base_pattern defines ONE bar that plays on EVERY bar without exception. " +
+            "variation_bars are ADDITIVE — they stack extra hits on top of the base for specific bars. " +
+            "Kick and snare always come from base_pattern. variation_bars are only for fills/crashes/accents.",
           strict: true,
           parameters: {
             type: "object",
@@ -779,7 +1447,7 @@ async function generateClipCommand(
               },
               variation_bars: {
                 type: "array",
-                description: "Optional overrides for specific bars (fills, crashes). Leave [] if none.",
+                description: "ADDITIVE extra hits stacked ON TOP of base_pattern for specific bars. Use for fills/crashes only. Leave [] if none.",
                 items: {
                   type: "object",
                   additionalProperties: false,
@@ -808,7 +1476,9 @@ async function generateClipCommand(
         },
       };
 
-      const response = await chatCompletion({
+      const response = await runGeneration({
+        allowWeb: true,
+        onProgress: (l) => update(l, 45),
         messages: [
           {
             role: "system",
@@ -818,6 +1488,15 @@ async function generateClipCommand(
               "This guarantees kick/snare lock — no drift across bars.",
               "Only override via variation_bars for fills on bar 4, 8, etc.",
               "",
+              "CRITICAL: Read the existing arrangement content carefully BEFORE writing any pattern.",
+              "If a bassline exists: lock the kick drum to its root note hit positions.",
+              "If a melody exists: leave space — don't put hi-hats on every note the melody plays.",
+              "Your groove must feel INTENTIONALLY written for this specific session, not generic.",
+              "",
+              "═══ PRODUCTION KNOWLEDGE (read and apply these skills) ═══",
+              selectSkills({ role: "drums", prompt }),
+              "═════════════════════════════════════════════════════════",
+              "",
               readDrumPadMap(track),
             ].join("\n"),
           },
@@ -825,6 +1504,8 @@ async function generateClipCommand(
             role: "user",
             content: [
               sessionCtx,
+              "",
+              siblingCtx,
               "",
               "╔══ TARGET DRUM TRACK ═══════════════════════════════════",
               `║  Track: "${track.name}"`,
@@ -835,8 +1516,9 @@ async function generateClipCommand(
               "",
               `USER REQUEST: "${prompt}"`,
               "",
-              "Define a tight base bar using the pad pitches above. The code handles repetition. " +
-              "Add a fill on the last bar of every 4-bar phrase via variation_bars.",
+              "Study the beat grids / note positions of the existing tracks above first. " +
+              "Then define a base bar where the kick locks to the bass, and hi-hats leave room for the melody. " +
+              "The code handles repetition — just define one tight bar.",
             ].join("\n"),
           },
         ],
@@ -863,6 +1545,7 @@ async function generateClipCommand(
         const clip  = await track.createMidiClip(input.startTime, input.duration);
         clip.name   = input.clipName;
         clip.notes  = expandDrumPattern(patternResult, input.duration);
+        clip.color  = CLIP_COLORS.drums;
         console.log(
           `[AI Copilot] Created drum clip "${input.clipName}" ` +
           `(${clip.notes.length} notes, ${input.duration} beats, ${Math.round(input.duration / 4)} bars).\n` +
@@ -874,6 +1557,8 @@ async function generateClipCommand(
     // ── Melody / chord / bass track ───────────────────────────────────────
     } else {
       const scaleConstraint = buildScaleConstraint(song);
+      const role   = inferTrackRole(track.name, false);
+      const skills = selectSkills({ role, prompt });
 
       const createClipTool: ToolDef = {
         type: "function",
@@ -916,15 +1601,25 @@ async function generateClipCommand(
         },
       };
 
-      const response = await chatCompletion({
+      const response = await runGeneration({
+        allowWeb: true,
+        onProgress: (l) => update(l, 45),
         messages: [
           {
             role: "system",
             content: [
               "You are an expert music producer and composer inside Ableton Live.",
               "You can see the full session — all tracks, clips, devices, and mixer state.",
-              "Generate MIDI that fits coherently into the existing arrangement.",
-              "Match the key, complement existing rhythms, fill gaps in the arrangement.",
+              "",
+              "CRITICAL: Read the existing arrangement content shown below BEFORE writing any notes.",
+              "If drums exist: look at the kick/snare positions and fit your rhythm around them.",
+              "If bass exists and you are writing melody: complement its harmonic motion, don't copy it.",
+              "If melody exists and you are writing bass: root notes should lock to kick drum hits.",
+              "Your part must sound like it was written FOR this session, not dropped in from elsewhere.",
+              "",
+              "═══ PRODUCTION KNOWLEDGE (read and apply these skills) ═══",
+              skills,
+              "═════════════════════════════════════════════════════════",
               "",
               MELODY_RULES,
               scaleConstraint,
@@ -934,6 +1629,8 @@ async function generateClipCommand(
             role: "user",
             content: [
               sessionCtx,
+              "",
+              siblingCtx,
               scaleConstraint,
               "",
               "╔══ TARGET TRACK ════════════════════════════════════════",
@@ -943,8 +1640,9 @@ async function generateClipCommand(
               "",
               `USER REQUEST: "${prompt}"`,
               "",
-              "Fill phrase_plan BEFORE placing notes. Sparse phrasing — 3-5 notes/bar with rests. " +
-              "Place at startTime=0 unless specified.",
+              "Study the existing content in this region first — beat grids, note positions, pitches. " +
+              "Then fill phrase_plan and write notes that lock in with what's already there. " +
+              "Sparse phrasing — rests are as important as notes.",
             ].join("\n"),
           },
         ],
@@ -961,13 +1659,15 @@ async function generateClipCommand(
           startTime: number; duration: number; clipName: string;
           phrase_plan: string; notes: NoteDescription[]; reasoning: string;
         };
-        const rawNotes = input.notes;
-        const gapped   = enforceGaps(rawNotes, 0.125);
-        const clip     = await track.createMidiClip(input.startTime, input.duration);
-        clip.name      = input.clipName;
-        clip.notes     = gapped;
+        const { notes, report } = runMelodyValidators(input.notes, song, {
+          maxPerBar: role === "chords" ? 16 : role === "bass" ? 10 : 8,
+        });
+        const clip = await track.createMidiClip(input.startTime, input.duration);
+        clip.name  = input.clipName;
+        clip.notes = notes;
+        clip.color = clipColorForTrack(track.name, false);
         console.log(
-          `[AI Copilot] Created "${input.clipName}" (${rawNotes.length}→${gapped.length} notes, ${input.duration} beats).\n` +
+          `[AI Copilot] Created "${input.clipName}" (${input.duration} beats) — ${report}.\n` +
           `  Phrase plan: ${input.phrase_plan}\n  Reasoning: ${input.reasoning}`,
         );
       }
@@ -1022,6 +1722,832 @@ async function analyzeSessionCommand(
   });
 }
 
+// ─── Command: Fill arrangement selection across multiple tracks ───────────────
+// Triggered via MidiTrack.ArrangementSelection — user selects a time range on
+// one or more MIDI tracks in the arrangement view, then right-clicks.
+// ArrangementSelection = { selected_lanes: Handle[], time_selection_start: number, time_selection_end: number }
+
+async function fillArrangementSelectionCommand(
+  context: ReturnType<typeof initialize>,
+  arg: unknown,
+): Promise<void> {
+  const selection = arg as {
+    selected_lanes: Handle[];
+    time_selection_start: number;
+    time_selection_end: number;
+  };
+
+  const song        = context.application.song!;
+  const startBeat   = selection.time_selection_start;
+  const endBeat     = selection.time_selection_end;
+  const duration    = endBeat - startBeat;
+  const totalBars   = Math.round(duration / 4);
+
+  if (duration <= 0 || selection.selected_lanes.length === 0) {
+    console.warn("[AI Copilot] fillArrangementSelection: empty selection, nothing to do.");
+    return;
+  }
+
+  // Resolve handles → MidiTrack objects
+  const tracks = selection.selected_lanes
+    .map((h) => {
+      try { return context.getObjectFromHandle(h, MidiTrack); }
+      catch { return null; }
+    })
+    .filter((t): t is MidiTrack<"1.0.0"> => t !== null);
+
+  if (tracks.length === 0) return;
+
+  const rawResult = await context.ui.showModalDialog(
+    `data:text/html,${encodeURIComponent(promptUI)}`,
+    440, 300,
+  );
+  const { prompt } = JSON.parse(rawResult) as { prompt: string | null };
+  if (!prompt) return;
+
+  await context.ui.withinProgressDialog(
+    `AI Copilot — Filling ${tracks.length} track(s) × ${totalBars} bar(s)…`,
+    {},
+    async (update, abortSignal) => {
+      update("Reading session…", 10);
+      const sessionCtx = buildSessionContext(song);
+      const scaleConstraint = buildScaleConstraint(song);
+
+      const trackSummary = tracks
+        .map((t) => `  • "${t.name}" (${isDrumTrack(t) ? "drums" : "MIDI"})`)
+        .join("\n");
+
+      // Build one tool that generates clips for ALL selected tracks at once
+      const fillSelectionTool: ToolDef = {
+        type: "function",
+        function: {
+          name: "fill_tracks",
+          description:
+            "Generate MIDI clips for multiple tracks simultaneously within a specific arrangement region. " +
+            "Return one entry per track. Match the musical role of each track name.",
+          strict: true,
+          parameters: {
+            type: "object",
+            additionalProperties: false,
+            required: ["tracks", "reasoning"],
+            properties: {
+              tracks: {
+                type: "array",
+                description: "One entry per selected track.",
+                items: {
+                  type: "object",
+                  additionalProperties: false,
+                  required: ["track_name", "clip_name", "phrase_plan", "notes"],
+                  properties: {
+                    track_name: { type: "string", description: "Must match one of the selected track names exactly." },
+                    clip_name:  { type: "string", description: "Descriptive name for this clip." },
+                    phrase_plan: {
+                      type: "string",
+                      description: "Plan your phrases before writing notes. e.g. 'Phrase 1: beats 0–6, rest 2 beats. Phrase 2: beats 8–14…'",
+                    },
+                    notes: {
+                      type: "array",
+                      description: "MIDI notes. Silence = gaps between notes. For melody: 3-7 notes/bar, varied velocities.",
+                      items: {
+                        type: "object",
+                        additionalProperties: false,
+                        required: ["pitch", "startTime", "duration", "velocity"],
+                        properties: {
+                          pitch:     { type: "number", description: "MIDI pitch 0-127" },
+                          startTime: { type: "number", description: "Offset from clip start in beats (NOT arrangement position)" },
+                          duration:  { type: "number", description: "Duration in beats" },
+                          velocity:  { type: "number", description: "Velocity 60-110, vary every note" },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+              reasoning: { type: "string", description: "How these parts work together musically." },
+            },
+          },
+        },
+      };
+
+      update("Thinking…", 30);
+
+      const response = await chatCompletion({
+        messages: [
+          {
+            role: "system",
+            content: [
+              "You are an expert music producer inside Ableton Live.",
+              "You are filling multiple tracks simultaneously in a specific arrangement region.",
+              "Each track gets its own clip. Parts must be complementary — do not double every track.",
+              "Match each track's musical role (bass stays low, melody stays sparse, etc.).",
+              "",
+              MELODY_RULES,
+              scaleConstraint,
+            ].join("\n"),
+          },
+          {
+            role: "user",
+            content: [
+              sessionCtx,
+              scaleConstraint,
+              "",
+              "╔══ ARRANGEMENT SELECTION ═══════════════════════════════════",
+              `║  Region:  beat ${startBeat.toFixed(1)} → beat ${endBeat.toFixed(1)}  (${totalBars} bars)`,
+              `║  Tracks to fill (${tracks.length}):`,
+              trackSummary,
+              "╚══════════════════════════════════════════════════════════",
+              "",
+              `USER REQUEST: "${prompt}"`,
+              "",
+              "Generate one cohesive part per track. All parts must work together.",
+              "For each track, plan phrases first in phrase_plan, then write sparse notes.",
+              "Note startTime is relative to the clip start (beat 0), not the arrangement position.",
+            ].join("\n"),
+          },
+        ],
+        tools: [fillSelectionTool],
+        tool_choice: "required",
+      });
+
+      if (abortSignal.aborted) return;
+      update("Writing to arrangement…", 80);
+
+      const toolCalls = response.choices[0]?.message?.tool_calls ?? [];
+      for (const call of toolCalls) {
+        if (call.function.name !== "fill_tracks") continue;
+        const result = JSON.parse(call.function.arguments) as {
+          tracks: Array<{
+            track_name: string;
+            clip_name: string;
+            phrase_plan: string;
+            notes: NoteDescription[];
+          }>;
+          reasoning: string;
+        };
+
+        for (const entry of result.tracks) {
+          const track = tracks.find(
+            (t) => t.name.toLowerCase() === entry.track_name.toLowerCase(),
+          );
+          if (!track) {
+            console.warn(`[AI Copilot] fillArrangement: no track found for "${entry.track_name}", skipping.`);
+            continue;
+          }
+
+          const rawNotes = entry.notes as NoteDescription[];
+          const gapped   = enforceGaps(rawNotes, 0.125);
+          const clip     = await track.createMidiClip(startBeat, duration);
+          clip.name      = entry.clip_name;
+          clip.notes     = gapped;
+          clip.color     = clipColorForTrack(track.name, isDrumTrack(track));
+          console.log(
+            `[AI Copilot] fillArrangement → "${track.name}": clip "${entry.clip_name}" ` +
+            `(${gapped.length} notes, ${totalBars} bars)\n  ${entry.phrase_plan}`,
+          );
+        }
+
+        console.log(`[AI Copilot] fillArrangement reasoning: ${result.reasoning}`);
+      }
+
+      update("Done!", 100);
+    },
+  );
+}
+
+// ─── Command: Fill multiple selected Session View clip slots ──────────────────
+// Triggered via ClipSlotSelection — user selects multiple slots in Session View
+// and right-clicks. ClipSlotSelection = { selected_clip_slots: Handle[] }
+
+async function fillClipSlotSelectionCommand(
+  context: ReturnType<typeof initialize>,
+  arg: unknown,
+): Promise<void> {
+  const selection = arg as { selected_clip_slots: Handle[] };
+  const song      = context.application.song!;
+
+  if (selection.selected_clip_slots.length === 0) return;
+
+  // Resolve handles → ClipSlots, then find their parent tracks
+  const slots = selection.selected_clip_slots
+    .map((h) => {
+      try { return context.getObjectFromHandle(h, ClipSlot); }
+      catch { return null; }
+    })
+    .filter((s): s is ClipSlot<"1.0.0"> => s !== null);
+
+  if (slots.length === 0) return;
+
+  const rawResult = await context.ui.showModalDialog(
+    `data:text/html,${encodeURIComponent(promptUI)}`,
+    440, 300,
+  );
+  const { prompt } = JSON.parse(rawResult) as { prompt: string | null };
+  if (!prompt) return;
+
+  await context.ui.withinProgressDialog(
+    `AI Copilot — Filling ${slots.length} slot(s)…`,
+    {},
+    async (update, abortSignal) => {
+      update("Reading session…", 10);
+      const sessionCtx      = buildSessionContext(song);
+      const scaleConstraint = buildScaleConstraint(song);
+
+      update("Thinking…", 30);
+
+      // Process each slot sequentially
+      let done = 0;
+      for (const slot of slots) {
+        if (abortSignal.aborted) break;
+
+        // Find the parent track for this slot
+        const parentTrack = song.tracks.find(
+          (t) => t instanceof MidiTrack &&
+                 t.clipSlots.some((cs) => cs === slot),
+        ) as MidiTrack<"1.0.0"> | undefined;
+
+        const trackName  = parentTrack?.name ?? "Unknown Track";
+        const drumMode   = parentTrack ? isDrumTrack(parentTrack) : false;
+
+        update(`Generating for "${trackName}"… (${done + 1}/${slots.length})`, 30 + (done / slots.length) * 50);
+
+        if (drumMode && parentTrack) {
+          // Drum slot — use bar-repeating pattern
+          const response = await runGeneration({
+            allowWeb: true,
+            onProgress: (l) => update(l, 45),
+            messages: [
+              {
+                role: "system",
+                content: [
+                  "You are a professional drum programmer inside Ableton Live.",
+                  "Define ONE base bar that repeats. Use variation_bars only for fills.",
+                  "",
+                  readDrumPadMap(parentTrack),
+                ].join("\n"),
+              },
+              {
+                role: "user",
+                content: [
+                  sessionCtx,
+                  "",
+                  `Filling a Session View slot on drum track: "${trackName}"`,
+                  readDrumPadMap(parentTrack),
+                  "",
+                  `USER REQUEST: "${prompt}"`,
+                ].join("\n"),
+              },
+            ],
+            tools: [SET_DRUM_PATTERN_TOOL],
+            tool_choice: "required",
+          });
+
+          for (const call of response.choices[0]?.message?.tool_calls ?? []) {
+            if (call.function.name !== "set_drum_pattern") continue;
+            const result     = JSON.parse(call.function.arguments) as DrumPatternResult;
+            const clipLength = 16; // 4 bars default for session clips
+            const clip       = await slot.createMidiClip(clipLength);
+            clip.notes       = expandDrumPattern(result, clipLength);
+            clip.color       = CLIP_COLORS.drums;
+          }
+
+        } else {
+          // Melody / chord / bass slot
+          const response = await runGeneration({
+            allowWeb: true,
+            onProgress: (l) => update(l, 45),
+            messages: [
+              {
+                role: "system",
+                content: [
+                  "You are an expert music producer inside Ableton Live.",
+                  "Generate a Session View clip for one track.",
+                  MELODY_RULES,
+                  scaleConstraint,
+                ].join("\n"),
+              },
+              {
+                role: "user",
+                content: [
+                  sessionCtx,
+                  scaleConstraint,
+                  "",
+                  `Filling a Session View slot on track: "${trackName}"`,
+                  `USER REQUEST: "${prompt}"`,
+                  "Clip length: 16 beats (4 bars). Plan phrases first, then write sparse notes.",
+                ].join("\n"),
+              },
+            ],
+            tools: [SET_NOTES_TOOL],
+            tool_choice: "required",
+          });
+
+          for (const call of response.choices[0]?.message?.tool_calls ?? []) {
+            if (call.function.name !== "set_notes") continue;
+            const args     = JSON.parse(call.function.arguments);
+            const rawNotes = args.notes as NoteDescription[];
+            const gapped   = enforceGaps(rawNotes, 0.125);
+            const clip     = await slot.createMidiClip(16);
+            clip.notes     = gapped;
+            clip.color     = clipColorForTrack(trackName, false);
+          }
+        }
+
+        done++;
+      }
+
+      update("Done!", 100);
+    },
+  );
+}
+
+// ─── Clip snapshot helper ─────────────────────────────────────────────────────
+// Since clip.startTime is read-only, "moving" a clip requires:
+//   1. Snapshot all data  2. deleteClip()  3. createMidiClip() at new position
+
+interface ClipSnapshot {
+  name:     string;
+  duration: number;
+  color:    number;
+  looping:  boolean;
+  muted:    boolean;
+  notes:    NoteDescription[];
+}
+
+function snapshotClip(clip: MidiClip<"1.0.0">): ClipSnapshot {
+  return {
+    name:    clip.name,
+    duration: clip.duration,
+    color:   clip.color,
+    looping: clip.looping,
+    muted:   clip.muted,
+    notes:   [...clip.notes],
+  };
+}
+
+async function restoreClipAt(
+  track: MidiTrack<"1.0.0">,
+  snap: ClipSnapshot,
+  newStart: number,
+): Promise<MidiClip<"1.0.0">> {
+  const clip   = await track.createMidiClip(newStart, snap.duration);
+  clip.name    = snap.name;
+  clip.color   = snap.color;
+  clip.looping = snap.looping;
+  clip.muted   = snap.muted;
+  clip.notes   = snap.notes;
+  return clip;
+}
+
+// ─── Command: Rearrange existing clips in the arrangement ─────────────────────
+// Triggered via Scene right-click. Reads every clip across every MIDI track,
+// asks AI to propose new positions, then moves clips using snapshot-delete-recreate.
+
+async function rearrangeArrangementCommand(
+  context: ReturnType<typeof initialize>,
+): Promise<void> {
+  const song = context.application.song!;
+
+  const midiTracks = song.tracks.filter(
+    (t): t is MidiTrack<"1.0.0"> => t instanceof MidiTrack && t.arrangementClips.length > 0,
+  );
+
+  if (midiTracks.length === 0) {
+    console.warn("[AI Copilot] rearrange: no MIDI tracks with arrangement clips found.");
+    return;
+  }
+
+  const rawResult = await context.ui.showModalDialog(
+    `data:text/html,${encodeURIComponent(promptUI)}`,
+    440, 300,
+  );
+  const { prompt } = JSON.parse(rawResult) as { prompt: string | null };
+  if (!prompt) return;
+
+  await context.ui.withinProgressDialog("AI Copilot — Rearranging…", {}, async (update, abortSignal) => {
+    update("Reading arrangement…", 10);
+
+    // Build a map of all clips per track
+    type TrackClipEntry = { track: MidiTrack<"1.0.0">; clip: MidiClip<"1.0.0">; startBeat: number; duration: number };
+    const allClips: TrackClipEntry[] = [];
+
+    for (const track of midiTracks) {
+      for (const clip of track.arrangementClips) {
+        if (clip instanceof MidiClip) {
+          allClips.push({ track, clip, startBeat: clip.startTime, duration: clip.duration });
+        }
+      }
+    }
+
+    // Format current layout for GPT
+    const currentLayout = allClips
+      .sort((a, b) => a.startBeat - b.startBeat)
+      .map(
+        (e) =>
+          `  track="${e.track.name}"  clip="${e.clip.name}"  ` +
+          `start=${e.startBeat.toFixed(1)} beats (bar ${Math.floor(e.startBeat / 4) + 1})  ` +
+          `duration=${e.duration.toFixed(1)} beats (${Math.round(e.duration / 4)} bars)`,
+      )
+      .join("\n");
+
+    const REARRANGE_TOOL: ToolDef = {
+      type: "function",
+      function: {
+        name: "rearrange_clips",
+        description:
+          "Propose new arrangement positions for existing clips. " +
+          "Only output clips that need to MOVE — omit clips that stay in place. " +
+          "Do not change clip durations. track_name and clip_name must exactly match existing values.",
+        strict: true,
+        parameters: {
+          type: "object",
+          additionalProperties: false,
+          required: ["moves", "reasoning"],
+          properties: {
+            moves: {
+              type: "array",
+              description: "List of clips to move. Empty array = no changes.",
+              items: {
+                type: "object",
+                additionalProperties: false,
+                required: ["track_name", "clip_name", "new_start_beat"],
+                properties: {
+                  track_name:     { type: "string", description: "Exact track name (copy from layout above)" },
+                  clip_name:      { type: "string", description: "Exact clip name (copy from layout above)" },
+                  new_start_beat: { type: "number", description: "New start position in beats (0 = arrangement start)" },
+                  new_name:       { type: "string", description: "Optional: rename the clip at its new position" },
+                },
+              },
+            },
+            reasoning: {
+              type: "string",
+              description: "Describe the new song structure — what went where and why.",
+            },
+          },
+        },
+      },
+    };
+
+    update("Thinking…", 30);
+
+    const response = await chatCompletion({
+      messages: [
+        {
+          role: "system",
+          content: [
+            "You are an expert music producer and arranger working inside Ableton Live.",
+            "You can see all clips in the arrangement and you will propose a better song structure.",
+            "Think in terms of song sections: intro, verse, pre-chorus, chorus, bridge, breakdown, outro.",
+            "A bar = 4 beats. Typical section lengths: 8 bars (32 beats), 16 bars (64 beats).",
+            "Only move clips that need to change position — leave others in place.",
+            "Do not change clip durations. track_name and clip_name must match EXACTLY.",
+          ].join("\n"),
+        },
+        {
+          role: "user",
+          content: [
+            buildSessionContext(song),
+            "",
+            "╔══ CURRENT ARRANGEMENT LAYOUT ══════════════════════════════",
+            currentLayout,
+            "╚══════════════════════════════════════════════════════════",
+            "",
+            `USER REQUEST: "${prompt}"`,
+            "",
+            "Propose new positions for clips that need to move. ",
+            "Return only clips that change position — omit clips that stay where they are.",
+          ].join("\n"),
+        },
+      ],
+      tools: [REARRANGE_TOOL],
+      tool_choice: "required",
+    });
+
+    if (abortSignal.aborted) return;
+    update("Moving clips…", 70);
+
+    const toolCalls = response.choices[0]?.message?.tool_calls ?? [];
+    for (const call of toolCalls) {
+      if (call.function.name !== "rearrange_clips") continue;
+      const plan = JSON.parse(call.function.arguments) as {
+        moves: Array<{ track_name: string; clip_name: string; new_start_beat: number; new_name?: string }>;
+        reasoning: string;
+      };
+
+      if (plan.moves.length === 0) {
+        console.log("[AI Copilot] rearrange: AI proposed no changes.");
+        update("No changes needed.", 100);
+        return;
+      }
+
+      console.log(`[AI Copilot] rearrange: ${plan.moves.length} moves.\n  ${plan.reasoning}`);
+
+      // Snapshot all clips that need to move BEFORE deleting anything
+      type MoveTask = {
+        track: MidiTrack<"1.0.0">;
+        snap: ClipSnapshot;
+        newStart: number;
+        newName?: string;
+      };
+      const tasks: MoveTask[] = [];
+
+      for (const move of plan.moves) {
+        const track = midiTracks.find((t) => t.name === move.track_name);
+        if (!track) {
+          console.warn(`[AI Copilot] rearrange: track "${move.track_name}" not found, skipping.`);
+          continue;
+        }
+        const clip = track.arrangementClips.find(
+          (c) => c instanceof MidiClip && c.name === move.clip_name,
+        ) as MidiClip<"1.0.0"> | undefined;
+        if (!clip) {
+          console.warn(`[AI Copilot] rearrange: clip "${move.clip_name}" not found on "${move.track_name}", skipping.`);
+          continue;
+        }
+        tasks.push({ track, snap: snapshotClip(clip), newStart: move.new_start_beat, newName: move.new_name });
+      }
+
+      // Delete originals first
+      for (const task of tasks) {
+        const clip = task.track.arrangementClips.find(
+          (c) => c instanceof MidiClip && c.name === task.snap.name,
+        ) as MidiClip<"1.0.0"> | undefined;
+        if (clip) await task.track.deleteClip(clip);
+      }
+
+      // Recreate at new positions
+      for (const task of tasks) {
+        const newClip = await restoreClipAt(task.track, task.snap, task.newStart);
+        if (task.newName) newClip.name = task.newName;
+        console.log(
+          `[AI Copilot] moved "${task.snap.name}" on "${task.track.name}" → ` +
+          `beat ${task.newStart} (bar ${Math.floor(task.newStart / 4) + 1})`,
+        );
+      }
+    }
+
+    update("Done!", 100);
+  });
+}
+
+// ─── Command: Build a full arrangement from scratch on existing tracks ─────────
+// Triggered via Scene right-click. AI designs a complete song structure —
+// sections, clip positions, MIDI content — and writes it all into the arrangement.
+
+async function buildArrangementCommand(
+  context: ReturnType<typeof initialize>,
+): Promise<void> {
+  const song = context.application.song!;
+
+  const midiTracks = song.tracks.filter(
+    (t): t is MidiTrack<"1.0.0"> => t instanceof MidiTrack,
+  );
+
+  if (midiTracks.length === 0) {
+    console.warn("[AI Copilot] buildArrangement: no MIDI tracks found.");
+    return;
+  }
+
+  const rawResult = await context.ui.showModalDialog(
+    `data:text/html,${encodeURIComponent(promptUI)}`,
+    440, 320,
+  );
+  const { prompt } = JSON.parse(rawResult) as { prompt: string | null };
+  if (!prompt) return;
+
+  await context.ui.withinProgressDialog("AI Copilot — Building arrangement…", {}, async (update, abortSignal) => {
+    update("Reading session…", 5);
+
+    const sessionCtx      = buildSessionContext(song);
+    const scaleConstraint = buildScaleConstraint(song);
+
+    const trackList = midiTracks
+      .map((t) => `  • "${t.name}" (${isDrumTrack(t) ? "drums" : "MIDI"})`)
+      .join("\n");
+
+    const BUILD_ARRANGEMENT_TOOL: ToolDef = {
+      type: "function",
+      function: {
+        name: "build_arrangement",
+        description:
+          "Design and populate a full arrangement across multiple tracks. " +
+          "Each clip gets a name, position, length, and MIDI content. " +
+          "For drum tracks use drum_pattern (bar-repeating). For melody/bass tracks use notes + phrase_plan.",
+        strict: false, // allow optional fields (drum_pattern vs notes)
+        parameters: {
+          type: "object",
+          required: ["sections", "clips", "reasoning"],
+          properties: {
+            sections: {
+              type: "array",
+              description: "High-level song sections for the arrangement.",
+              items: {
+                type: "object",
+                required: ["name", "start_beat", "duration_beats"],
+                properties: {
+                  name:           { type: "string", description: "e.g. Intro, Verse 1, Chorus, Bridge, Outro" },
+                  start_beat:     { type: "number", description: "Section start in beats" },
+                  duration_beats: { type: "number", description: "Section length in beats (32=8 bars, 64=16 bars)" },
+                },
+              },
+            },
+            clips: {
+              type: "array",
+              description: "All clips to create. One clip per track per section (or per role).",
+              items: {
+                type: "object",
+                required: ["track_name", "clip_name", "start_beat", "duration_beats"],
+                properties: {
+                  track_name:     { type: "string", description: "Must match an existing track name exactly." },
+                  clip_name:      { type: "string", description: "Descriptive name, e.g. 'Verse Bass', 'Chorus Lead'" },
+                  start_beat:     { type: "number", description: "Clip start in beats (0 = arrangement start)" },
+                  duration_beats: { type: "number", description: "Clip length in beats" },
+                  // Drum tracks
+                  drum_pattern: {
+                    type: "object",
+                    description: "Use this for drum tracks. Define one base bar that repeats.",
+                    properties: {
+                      base_pattern: {
+                        type: "object",
+                        properties: {
+                          hits: {
+                            type: "array",
+                            items: {
+                              type: "object",
+                              required: ["pitch", "beat", "velocity"],
+                              properties: {
+                                pitch:    { type: "number" },
+                                beat:     { type: "number" },
+                                velocity: { type: "number" },
+                              },
+                            },
+                          },
+                        },
+                      },
+                      variation_bars: {
+                        type: "array",
+                        items: {
+                          type: "object",
+                          required: ["bar_index", "hits"],
+                          properties: {
+                            bar_index: { type: "number" },
+                            hits: {
+                              type: "array",
+                              items: {
+                                type: "object",
+                                required: ["pitch", "beat", "velocity"],
+                                properties: {
+                                  pitch:    { type: "number" },
+                                  beat:     { type: "number" },
+                                  velocity: { type: "number" },
+                                },
+                              },
+                            },
+                          },
+                        },
+                      },
+                    },
+                  },
+                  // Melody / bass / chord tracks
+                  phrase_plan: { type: "string", description: "Plan your phrases before notes." },
+                  notes: {
+                    type: "array",
+                    description: "Use for non-drum tracks. 3-7 notes/bar, leave gaps for silence.",
+                    items: {
+                      type: "object",
+                      required: ["pitch", "startTime", "duration", "velocity"],
+                      properties: {
+                        pitch:     { type: "number" },
+                        startTime: { type: "number", description: "Offset from clip start in beats" },
+                        duration:  { type: "number" },
+                        velocity:  { type: "number" },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+            reasoning: {
+              type: "string",
+              description: "Describe the song structure, how the sections flow, and what each track does.",
+            },
+          },
+        },
+      },
+    };
+
+    update("Thinking…", 15);
+
+    const response = await chatCompletion({
+      messages: [
+        {
+          role: "system",
+          content: [
+            "You are an expert music producer and arranger working in Ableton Live.",
+            "You will design a complete song arrangement across multiple tracks.",
+            "Think in sections: Intro → Verse → Pre-Chorus → Chorus → Breakdown → Outro.",
+            "Each section should be 8 or 16 bars (32 or 64 beats).",
+            "Drum tracks use drum_pattern (one bar, bar-repeating). Vary the pattern between sections.",
+            "Melody/bass tracks use notes + phrase_plan. Keep melodies sparse and sectional.",
+            "Clips in different sections on the same track should have different names and vary musically.",
+            "",
+            MELODY_RULES,
+            scaleConstraint,
+          ].join("\n"),
+        },
+        {
+          role: "user",
+          content: [
+            sessionCtx,
+            scaleConstraint,
+            "",
+            "╔══ AVAILABLE TRACKS ══════════════════════════════════════",
+            trackList,
+            "╚══════════════════════════════════════════════════════════",
+            "",
+            `USER REQUEST: "${prompt}"`,
+            "",
+            "Design a full arrangement. Use sections (Intro, Verse, Chorus…).",
+            "Create clips for EVERY track across ALL sections.",
+            "Keep drum patterns section-specific (intro sparse, chorus full).",
+            "Melody clips should vary per section — same key, different phrases.",
+          ].join("\n"),
+        },
+      ],
+      tools: [BUILD_ARRANGEMENT_TOOL],
+      tool_choice: "required",
+    });
+
+    if (abortSignal.aborted) return;
+    update("Writing arrangement to Live…", 70);
+
+    const toolCalls = response.choices[0]?.message?.tool_calls ?? [];
+    for (const call of toolCalls) {
+      if (call.function.name !== "build_arrangement") continue;
+
+      const plan = JSON.parse(call.function.arguments) as {
+        sections: Array<{ name: string; start_beat: number; duration_beats: number }>;
+        clips: Array<{
+          track_name: string;
+          clip_name: string;
+          start_beat: number;
+          duration_beats: number;
+          drum_pattern?: { base_pattern: { hits: DrumHit[] }; variation_bars: Array<{ bar_index: number; hits: DrumHit[] }> };
+          phrase_plan?: string;
+          notes?: NoteDescription[];
+        }>;
+        reasoning: string;
+      };
+
+      console.log(
+        `[AI Copilot] buildArrangement: ${plan.sections.length} sections, ${plan.clips.length} clips.\n` +
+        `  Structure: ${plan.sections.map((s) => s.name).join(" → ")}\n` +
+        `  ${plan.reasoning}`,
+      );
+
+      let done = 0;
+      for (const entry of plan.clips) {
+        if (abortSignal.aborted) break;
+
+        const track = midiTracks.find((t) => t.name === entry.track_name);
+        if (!track) {
+          console.warn(`[AI Copilot] buildArrangement: track "${entry.track_name}" not found, skipping.`);
+          continue;
+        }
+
+        update(
+          `Creating "${entry.clip_name}" on "${entry.track_name}"… (${done + 1}/${plan.clips.length})`,
+          70 + (done / plan.clips.length) * 25,
+        );
+
+        const clip = await track.createMidiClip(entry.start_beat, entry.duration_beats);
+        clip.name  = entry.clip_name;
+
+        if (entry.drum_pattern && isDrumTrack(track)) {
+          const patternResult: DrumPatternResult = {
+            base_pattern:   entry.drum_pattern.base_pattern,
+            variation_bars: entry.drum_pattern.variation_bars ?? [],
+            reasoning:      "",
+          };
+          clip.notes = expandDrumPattern(patternResult, entry.duration_beats);
+          clip.color = CLIP_COLORS.drums;
+        } else if (entry.notes && entry.notes.length > 0) {
+          clip.notes = enforceGaps(entry.notes as NoteDescription[], 0.125);
+          clip.color = clipColorForTrack(track.name, false);
+        }
+
+        console.log(
+          `[AI Copilot] buildArrangement → "${entry.clip_name}" on "${entry.track_name}" ` +
+          `@ beat ${entry.start_beat} (bar ${Math.floor(entry.start_beat / 4) + 1}), ` +
+          `${entry.duration_beats} beats, ${clip.notes.length} notes`,
+        );
+        done++;
+      }
+    }
+
+    update("Done!", 100);
+  });
+}
+
 // ─── Entry point ──────────────────────────────────────────────────────────────
 
 export function activate(activation: ActivationContext): void {
@@ -1036,10 +2562,38 @@ export function activate(activation: ActivationContext): void {
   context.commands.registerCommand("copilot.analyzeSession", () =>
     analyzeSessionCommand(context).catch((e) => console.error("[AI Copilot] analyzeSession error:", e)),
   );
+  context.commands.registerCommand("copilot.fillArrangementSelection", (arg) =>
+    fillArrangementSelectionCommand(context, arg).catch((e) => console.error("[AI Copilot] fillArrangement error:", e)),
+  );
+  context.commands.registerCommand("copilot.fillClipSlotSelection", (arg) =>
+    fillClipSlotSelectionCommand(context, arg).catch((e) => console.error("[AI Copilot] fillClipSlots error:", e)),
+  );
+  context.commands.registerCommand("copilot.rearrangeArrangement", () =>
+    rearrangeArrangementCommand(context).catch((e) => console.error("[AI Copilot] rearrange error:", e)),
+  );
+  context.commands.registerCommand("copilot.buildArrangement", () =>
+    buildArrangementCommand(context).catch((e) => console.error("[AI Copilot] buildArrangement error:", e)),
+  );
 
-  context.ui.registerContextMenuAction("MidiClip",  "🤖 AI: Edit this clip",       "copilot.editClip");
-  context.ui.registerContextMenuAction("MidiTrack", "🤖 AI: Generate clip",        "copilot.generateClip");
-  context.ui.registerContextMenuAction("Scene",     "🤖 AI: Analyze full session", "copilot.analyzeSession");
+  // Single-object scopes
+  context.ui.registerContextMenuAction("MidiClip",  "🤖 AI: Edit this clip",        "copilot.editClip");
+  context.ui.registerContextMenuAction("MidiTrack", "🤖 AI: Generate clip",         "copilot.generateClip");
 
-  console.log(`[AI Copilot] Loaded with ${MODEL} — right-click any MIDI clip, MIDI track, or Scene.`);
+  // Scene scopes — multiple actions on the same scope
+  context.ui.registerContextMenuAction("Scene", "🤖 AI: Analyze full session",   "copilot.analyzeSession");
+  context.ui.registerContextMenuAction("Scene", "🤖 AI: Rearrange clips",        "copilot.rearrangeArrangement");
+  context.ui.registerContextMenuAction("Scene", "🤖 AI: Build arrangement",      "copilot.buildArrangement");
+
+  // Multi-object / arrangement scopes
+  context.ui.registerContextMenuAction("MidiTrack.ArrangementSelection", "🤖 AI: Fill selection",       "copilot.fillArrangementSelection");
+  context.ui.registerContextMenuAction("ClipSlotSelection",              "🤖 AI: Fill selected slots",  "copilot.fillClipSlotSelection");
+
+  console.log(
+    `[AI Copilot] Loaded with ${MODEL}\n` +
+    `  • Right-click MIDI clip              → Edit this clip\n` +
+    `  • Right-click MIDI track             → Generate clip\n` +
+    `  • Right-click Scene                  → Analyze / Rearrange / Build arrangement\n` +
+    `  • Select arrangement region          → Fill selection (multi-track)\n` +
+    `  • Select multiple session view slots → Fill selected slots`,
+  );
 }

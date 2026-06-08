@@ -14,8 +14,8 @@ await esbuild.build({
   logLevel: "info",
   minify: production,
   sourcemap: !production,
-  // Inline HTML files as text strings
-  loader: { ".html": "text" },
+  // Inline HTML + Markdown skill files as text strings
+  loader: { ".html": "text", ".md": "text" },
   // Don't bundle the Anthropic SDK's native optional deps
   external: ["fsevents"],
 });
