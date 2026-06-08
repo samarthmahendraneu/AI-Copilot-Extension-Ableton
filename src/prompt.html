@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI Copilot</title>
+  <style>
+    /* ── Ableton dark theme variables ────────────────────────── */
+    :root {
+      --bg:            hsl(0, 0%, 21%);
+      --bg-deep:       hsl(0, 0%, 15%);
+      --input-bg:      hsl(0, 0%, 12%);
+      --text:          hsl(0, 0%, 71%);
+      --text-dim:      hsl(0, 0%, 41%);
+      --border:        hsl(0, 0%, 7%);
+      --accent:        hsl(31, 100%, 67%);
+      --accent-text:   hsl(0, 0%, 7%);
+      --btn-bg:        hsl(0, 0%, 16%);
+      --btn-bg-hover:  hsl(0, 0%, 13%);
+    }
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html {
+      height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "AbletonSansSmall", ui-sans-serif, system-ui, sans-serif;
+      font-size: 11.5px;
+      font-weight: 500;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    body {
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      padding: 16px;
+      gap: 12px;
+    }
+
+    /* ── Header ────────────────────────────────────────────────── */
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .header .icon { font-size: 18px; line-height: 1; }
+    .header h1 {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text);
+      letter-spacing: 0.02em;
+    }
+    .header p {
+      font-size: 10px;
+      color: var(--text-dim);
+      margin-top: 1px;
+    }
+
+    /* ── Hint chips ────────────────────────────────────────────── */
+    .hints {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+    }
+    .hint {
+      background: var(--bg-deep);
+      border: 1px solid var(--border);
+      color: var(--text-dim);
+      font-size: 9.5px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      cursor: pointer;
+      user-select: none;
+      transition: color 0.1s, border-color 0.1s;
+    }
+    .hint:hover {
+      color: var(--text);
+      border-color: var(--text-dim);
+    }
+
+    /* ── Textarea ──────────────────────────────────────────────── */
+    textarea {
+      flex: 1;
+      resize: none;
+      background: var(--input-bg);
+      color: var(--text);
+      border: 1px solid var(--border);
+      padding: 8px;
+      font: inherit;
+      font-size: 11.5px;
+      line-height: 1.5;
+      outline: none;
+      min-height: 80px;
+    }
+    textarea:focus { border-color: var(--text-dim); }
+    textarea::placeholder { color: var(--text-dim); }
+
+    /* ── Buttons ───────────────────────────────────────────────── */
+    .buttons {
+      display: flex;
+      gap: 6px;
+      justify-content: flex-end;
+    }
+    button {
+      font: inherit;
+      font-size: 11px;
+      height: 22px;
+      padding: 0 14px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      cursor: pointer;
+      user-select: none;
+      white-space: nowrap;
+    }
+    .btn-cancel {
+      background: var(--btn-bg);
+      color: var(--text);
+    }
+    .btn-cancel:hover { background: var(--btn-bg-hover); }
+
+    .btn-submit {
+      background: var(--accent);
+      color: var(--accent-text);
+      border-color: transparent;
+      font-weight: 600;
+    }
+    .btn-submit:hover { opacity: 0.9; }
+    .btn-submit:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    /* ── Branding ──────────────────────────────────────────────── */
+    .branding {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .branding-by {
+      font-size: 9px;
+      color: var(--text-dim);
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      opacity: 0.7;
+      white-space: nowrap;
+    }
+    .branding-by span {
+      color: var(--accent);
+      opacity: 1;
+    }
+  </style>
+</head>
+<body>
+  <div class="branding">
+    <div class="header">
+      <span class="icon">🤖</span>
+      <div>
+        <h1>AI Copilot</h1>
+        <p>Describe what you want to create or change</p>
+      </div>
+    </div>
+    <div class="branding-by">by <span>Samarth Mahendra</span></div>
+  </div>
+
+  <!-- Quick-pick hint chips -->
+  <div class="hints" id="hints"></div>
+
+  <textarea
+    id="prompt"
+    placeholder="e.g. "Add a bassline that follows these chords" or "Make this more syncopated and add swing""
+    autofocus
+  ></textarea>
+
+  <div class="buttons">
+    <button class="btn-cancel" onclick="cancel()">Cancel</button>
+    <button class="btn-submit" id="submitBtn" onclick="submit()" disabled>Generate ✦</button>
+  </div>
+
+  <script>
+    // ── WebView bridge ──────────────────────────────────────────
+    const isWebKit  = window.webkit?.messageHandlers?.live;
+    const isWebView2 = window.chrome?.webview;
+
+    function postToLive(message) {
+      if (isWebKit)   window.webkit.messageHandlers.live.postMessage(message);
+      else if (isWebView2) window.chrome.webview.postMessage(message);
+    }
+
+    function closeWith(result) {
+      postToLive({ method: "close_and_send", params: [JSON.stringify(result)] });
+    }
+
+    function cancel() { closeWith({ prompt: null }); }
+    function submit() {
+      const text = document.getElementById("prompt").value.trim();
+      if (text) closeWith({ prompt: text });
+    }
+
+    // ── Enable/disable submit button ────────────────────────────
+    const promptEl   = document.getElementById("prompt");
+    const submitBtn  = document.getElementById("submitBtn");
+    promptEl.addEventListener("input", () => {
+      submitBtn.disabled = promptEl.value.trim().length === 0;
+    });
+
+    // ── Keyboard shortcuts ──────────────────────────────────────
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") cancel();
+      // Cmd/Ctrl+Enter submits
+      if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) submit();
+    });
+
+    // ── Hint chips ──────────────────────────────────────────────
+    const HINTS = [
+      "Add chord extensions (7ths, 9ths)",
+      "Make it more syncopated",
+      "Transpose up a 5th",
+      "Add a counter-melody",
+      "Convert to minor",
+      "Humanize the velocities",
+      "Generate a 4-bar bassline",
+      "Double the tempo feel",
+    ];
+
+    const hintsEl = document.getElementById("hints");
+    HINTS.forEach((hint) => {
+      const chip = document.createElement("button");
+      chip.className = "hint";
+      chip.textContent = hint;
+      chip.addEventListener("click", () => {
+        promptEl.value = hint;
+        submitBtn.disabled = false;
+        promptEl.focus();
+      });
+      hintsEl.appendChild(chip);
+    });
+
+    // Auto-focus
+    promptEl.focus();
+  </script>
+</body>
+</html>

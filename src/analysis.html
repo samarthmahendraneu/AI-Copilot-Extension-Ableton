@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Session Analysis</title>
+  <style>
+    :root {
+      --bg:          hsl(0, 0%, 21%);
+      --bg-deep:     hsl(0, 0%, 15%);
+      --text:        hsl(0, 0%, 71%);
+      --text-dim:    hsl(0, 0%, 41%);
+      --border:      hsl(0, 0%, 7%);
+      --accent:      hsl(31, 100%, 67%);
+      --accent-text: hsl(0, 0%, 7%);
+      --btn-bg:      hsl(0, 0%, 16%);
+    }
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html {
+      height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "AbletonSansSmall", ui-sans-serif, system-ui, sans-serif;
+      font-size: 11.5px;
+      font-weight: 500;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    body {
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      padding: 16px;
+      gap: 12px;
+    }
+
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-shrink: 0;
+    }
+    .header .icon { font-size: 18px; }
+    .header h1  { font-size: 13px; font-weight: 600; }
+    .header p   { font-size: 10px; color: var(--text-dim); margin-top: 1px; }
+
+    .analysis-box {
+      flex: 1;
+      overflow-y: auto;
+      background: var(--bg-deep);
+      border: 1px solid var(--border);
+      padding: 12px;
+      line-height: 1.65;
+      font-size: 11px;
+      color: var(--text);
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .buttons {
+      display: flex;
+      justify-content: flex-end;
+      flex-shrink: 0;
+    }
+
+    button {
+      font: inherit;
+      font-size: 11px;
+      height: 22px;
+      padding: 0 14px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      cursor: pointer;
+      background: var(--accent);
+      color: var(--accent-text);
+      border-color: transparent;
+      font-weight: 600;
+    }
+    button:hover { opacity: 0.9; }
+
+    .header-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-shrink: 0;
+    }
+    .branding-by {
+      font-size: 9px;
+      color: var(--text-dim);
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      opacity: 0.7;
+    }
+    .branding-by span { color: var(--accent); opacity: 1; }
+  </style>
+</head>
+<body>
+  <div class="header-row">
+    <div class="header">
+      <span class="icon">📊</span>
+      <div>
+        <h1>Session Analysis</h1>
+        <p>AI Copilot's take on your current session</p>
+      </div>
+    </div>
+    <div class="branding-by">by <span>Samarth Mahendra</span></div>
+  </div>
+
+  <div class="analysis-box">{{ANALYSIS}}</div>
+
+  <div class="buttons">
+    <button onclick="close()">Close</button>
+  </div>
+
+  <script>
+    const isWebKit   = window.webkit?.messageHandlers?.live;
+    const isWebView2 = window.chrome?.webview;
+
+    function postToLive(message) {
+      if (isWebKit)    window.webkit.messageHandlers.live.postMessage(message);
+      else if (isWebView2) window.chrome.webview.postMessage(message);
+    }
+
+    function close() {
+      postToLive({ method: "close_and_send", params: [JSON.stringify({ closed: true })] });
+    }
+
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" || e.key === "Enter") close();
+    });
+  </script>
+</body>
+</html>

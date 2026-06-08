@@ -1,0 +1,7 @@
+{
+  "name": "AI Copilot",
+  "author": "Samarth Mahendra",
+  "entry": "dist/extension.js",
+  "version": "0.1.0",
+  "minimumApiVersion": "1.0.0"
+}
