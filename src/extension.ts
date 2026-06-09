@@ -7,6 +7,8 @@ import {
   AudioTrack,
   DrumRack,
   ClipSlot,
+  Device,
+  Simpler,
   type ActivationContext,
   type Handle,
   type NoteDescription,
@@ -16,12 +18,13 @@ import promptUI from "./prompt.html";
 import analysisUI from "./analysis.html";
 
 // ─── Skill knowledge packs (bundled as text via esbuild .md loader) ──────────
-import skillCore   from "./skills/_core.md";
-import skillDrums  from "./skills/drums.md";
-import skillHipHop from "./skills/hiphop.md";
-import skillHouse  from "./skills/house.md";
-import skillMelody from "./skills/melody.md";
-import skillBass   from "./skills/bass.md";
+import skillCore        from "./skills/_core.md";
+import skillDrums       from "./skills/drums.md";
+import skillHipHop      from "./skills/hiphop.md";
+import skillHouse       from "./skills/house.md";
+import skillMelody      from "./skills/melody.md";
+import skillBass        from "./skills/bass.md";
+import skillSoundDesign from "./skills/sound-design.md";
 
 const MODEL = "gpt-5.2";
 
@@ -38,11 +41,12 @@ interface Skill {
 }
 
 const SKILLS: Skill[] = [
-  { id: "drums",  content: skillDrums,  keywords: /drum|beat|kick|snare|hat|hi-?hat|percussion|groove|fill|808|clap/i },
-  { id: "hiphop", content: skillHipHop, keywords: /hip.?hop|boom.?bap|trap|lo.?fi|lofi|rap|drill|j.?dilla|mpc/i },
-  { id: "house",  content: skillHouse,  keywords: /house|techno|four.?on.?the.?floor|deep house|tech house|edm|dance|club|rave/i },
-  { id: "melody", content: skillMelody, keywords: /melod|lead|hook|topline|riff|chord|harmon|progression|counter|arp/i },
-  { id: "bass",   content: skillBass,   keywords: /bass|808|sub|low.?end|bassline/i },
+  { id: "drums",       content: skillDrums,       keywords: /drum|beat|kick|snare|hat|hi-?hat|percussion|groove|fill|808|clap/i },
+  { id: "hiphop",      content: skillHipHop,      keywords: /hip.?hop|boom.?bap|trap|lo.?fi|lofi|rap|drill|j.?dilla|mpc/i },
+  { id: "house",       content: skillHouse,       keywords: /house|techno|four.?on.?the.?floor|deep house|tech house|edm|dance|club|rave/i },
+  { id: "melody",      content: skillMelody,      keywords: /melod|lead|hook|topline|riff|chord|harmon|progression|counter|arp/i },
+  { id: "bass",        content: skillBass,        keywords: /bass|808|sub|low.?end|bassline/i },
+  { id: "sound-design", content: skillSoundDesign, keywords: /warm|bright|dark|dusty|gritty|punch|airy|pad|pluck|smooth|glassy|metallic|bell|sub|lead|synth|sound.?design|wavetable|operator|simpler|filter|cutoff|reverb|delay|attack|decay|sustain|release|envelope|lfo|resonan|saturat|compress/i },
 ];
 
 type TrackRole = "drums" | "bass" | "chords" | "melody" | "unknown";
@@ -76,7 +80,7 @@ function selectSkills(opts: { role: TrackRole; prompt: string }): string {
   }
 
   // Assemble: _core first, then the selected packs in a stable order
-  const order = ["drums", "bass", "melody", "hiphop", "house"];
+  const order = ["drums", "bass", "melody", "hiphop", "house", "sound-design"];
   const parts = [skillCore];
   for (const id of order) {
     if (chosen.has(id)) {
@@ -369,8 +373,13 @@ async function runGeneration(opts: {
       continue; // ask the model again now that it has the page content
     }
 
-    // No terminal call and no fetch — return whatever we got (caller handles empty).
-    return response;
+    // No terminal call and no fetch — model chose not to call any tool (only possible on "auto" choice).
+    // Add its reasoning to context and continue — once fetches are exhausted, choice becomes "required"
+    // and the model is forced to call a terminal tool rather than silently returning nothing.
+    if (msg?.content) {
+      messages.push({ role: "assistant", content: msg.content });
+    }
+    continue;
   }
 
   // Exhausted iterations: force one final generation pass with web disabled.
@@ -433,8 +442,8 @@ function readDrumPadMap(track: MidiTrack<"1.0.0">): string {
   for (const chain of sorted) {
     const note  = chain.receivingNote;
     const name  = pitchToName(note);
-    // chain.name can be undefined for empty/unnamed pads — guard it.
-    const label = (chain.name ?? "").trim() || "(unnamed pad)";
+    // DrumChain has a runtime .name property that TypeScript types don't expose — cast to access it.
+    const label = (((chain as unknown) as { name?: string }).name ?? "").trim() || "(unnamed pad)";
     lines.push(`  ${note.toString().padStart(3)} (${name.padEnd(4)}) = ${label}`);
   }
 
@@ -721,10 +730,11 @@ function snapToScale(notes: NoteDescription[], allowed: Set<number> | null): Not
     const pc = ((n.pitch % 12) + 12) % 12;
     if (allowed.has(pc)) return n;
 
-    // Search outward for the nearest allowed pitch class (±6 semitones max)
+    // Search outward for the nearest allowed pitch class (±6 semitones max).
+    // Clamp the result to valid MIDI range [0, 127] — going below 0 or above 127 would be invalid.
     for (let dist = 1; dist <= 6; dist++) {
-      if (allowed.has((pc + dist) % 12))      return { ...n, pitch: n.pitch + dist };
-      if (allowed.has((pc - dist + 12) % 12)) return { ...n, pitch: n.pitch - dist };
+      if (allowed.has((pc + dist) % 12))      return { ...n, pitch: Math.min(127, n.pitch + dist) };
+      if (allowed.has((pc - dist + 12) % 12)) return { ...n, pitch: Math.max(0,   n.pitch - dist) };
     }
     return n; // unreachable for any real scale
   });
@@ -926,17 +936,12 @@ function buildSessionContext(
       track.arm    ? "armed" : null,
     ].filter(Boolean).join(", ");
 
-    // Mixer
-    const vol = track.mixer.volume.value;
-    const pan = track.mixer.panning.value;
-    const volDb = vol > 0 ? `${(20 * Math.log10(vol)).toFixed(1)} dB` : "-inf dB";
-    const panStr = pan === 0 ? "C" : pan > 0 ? `R${(pan * 100).toFixed(0)}` : `L${(-pan * 100).toFixed(0)}`;
-
-    // Devices
+    // Devices (mixer volume/panning require async getValue() — shown via sound design command)
     const deviceNames = track.devices.map((d) => d.name).join(", ") || "none";
+    const sendCount   = track.mixer.sends.length;
 
     lines.push(`┌─ [${type}] "${track.name}" ${flags ? `(${flags})` : ""}`);
-    lines.push(`│  Mixer: vol=${volDb}  pan=${panStr}`);
+    lines.push(`│  Mixer: ${sendCount} send(s)`);
     lines.push(`│  Devices: ${deviceNames}`);
 
     // Arrangement clips
@@ -1154,6 +1159,412 @@ function buildSiblingContext(
   return lines.join("\n");
 }
 
+// ─── Sound design: read device parameters ─────────────────────────────────────
+// DeviceParameter.getValue() is async. We read all params concurrently so the
+// AI gets the full snapshot in one shot without sequential round-trips.
+
+interface ParamState {
+  name:         string;
+  min:          number;
+  max:          number;
+  currentValue: number;
+  defaultValue: number;
+  isQuantized:  boolean;
+  valueItems:   string[]; // enum option labels for quantized knobs (e.g. Filter Type)
+}
+
+interface DeviceState {
+  name:   string;
+  params: ParamState[];
+}
+
+/** Read every parameter of a single device, concurrently. Unreadable params are skipped. */
+async function readDeviceParams(device: Device<"1.0.0">): Promise<ParamState[]> {
+  const results = await Promise.all(
+    device.parameters.map(async (param) => {
+      try {
+        const currentValue = await param.getValue();
+        return {
+          name:         param.name,
+          min:          param.min,
+          max:          param.max,
+          currentValue,
+          defaultValue: param.defaultValue,
+          isQuantized:  param.isQuantized,
+          valueItems:   param.valueItems.map((v) => v.name),
+        } satisfies ParamState;
+      } catch {
+        return null; // param is not readable (e.g. internal/hidden)
+      }
+    }),
+  );
+  return results.filter((r): r is ParamState => r !== null);
+}
+
+/** Read all devices on a list concurrently — returns one DeviceState per device. */
+async function readAllDeviceStates(devices: Device<"1.0.0">[]): Promise<DeviceState[]> {
+  return Promise.all(
+    devices.map(async (d) => ({
+      name:   d.name,
+      params: await readDeviceParams(d),
+    })),
+  );
+}
+
+/** Format DeviceState[] into a readable prompt block for the AI. */
+function formatDeviceStates(deviceStates: DeviceState[]): string {
+  if (deviceStates.length === 0) return "  (no devices with readable parameters)";
+
+  return deviceStates
+    .map(({ name, params }) => {
+      if (params.length === 0) return `  Device: "${name}" (no readable parameters)`;
+
+      const paramLines = params.map((p) => {
+        const range    = `[${p.min.toFixed(2)}–${p.max.toFixed(2)}]`;
+        const atDef    = Math.abs(p.currentValue - p.defaultValue) < 0.001 ? " (default)" : "";
+        const opts     = p.isQuantized && p.valueItems.length > 0
+          ? ` options=[${p.valueItems.join("|")}]`
+          : "";
+        const current  = p.isQuantized && p.valueItems.length > 0
+          ? `${p.currentValue.toFixed(0)} = "${p.valueItems[Math.round(p.currentValue)] ?? p.currentValue.toFixed(0)}"`
+          : p.currentValue.toFixed(3);
+
+        return `    "${p.name}" = ${current}  range=${range}${opts}${atDef}`;
+      });
+
+      return [`  Device: "${name}" (${params.length} params)`, ...paramLines].join("\n");
+    })
+    .join("\n\n");
+}
+
+// ─── Sound design tool ────────────────────────────────────────────────────────
+// The AI calls this to apply a set of parameter changes. We do case-insensitive
+// matching and clamp values to [min, max] as a safety guard.
+
+const SET_DEVICE_PARAMS_TOOL: ToolDef = {
+  type: "function",
+  function: {
+    name: "set_device_params",
+    description:
+      "Sculpt the sound by changing device parameters. " +
+      "Only include parameters that need to change — omit unchanged ones. " +
+      "Values MUST be within each parameter's reported [min, max] range. " +
+      "For quantized (enum) params the value is the integer index into the options list. " +
+      "Reference exact device_name and param_name strings from the context — no guessing.",
+    strict: true,
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      required: ["changes", "reasoning"],
+      properties: {
+        changes: {
+          type: "array",
+          description: "Parameter changes to apply. Empty [] = no changes needed.",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            required: ["device_name", "param_name", "value"],
+            properties: {
+              device_name: {
+                type: "string",
+                description: "Exact device name from the context (case-insensitive match).",
+              },
+              param_name: {
+                type: "string",
+                description: "Exact parameter name from the context (case-insensitive match).",
+              },
+              value: {
+                type: "number",
+                description:
+                  "New value within [min, max]. For quantized params use the integer option index.",
+              },
+            },
+          },
+        },
+        reasoning: {
+          type: "string",
+          description:
+            "Explain each change: what you adjusted and how it achieves the described sound.",
+        },
+      },
+    },
+  },
+};
+
+/**
+ * Apply a set_device_params result against a list of available devices.
+ * Does case-insensitive matching on both device name and param name.
+ * Clamps values to [min, max] as a safety net.
+ * Returns how many params were successfully changed.
+ */
+async function applyDeviceParamChanges(
+  changes: Array<{ device_name: string; param_name: string; value: number }>,
+  devices: Device<"1.0.0">[],
+): Promise<number> {
+  let changedCount = 0;
+
+  for (const change of changes) {
+    const device = devices.find(
+      (d) => d.name.toLowerCase() === change.device_name.toLowerCase(),
+    );
+    if (!device) {
+      console.warn(`[AI Copilot] soundDesign: device "${change.device_name}" not found — skipping.`);
+      continue;
+    }
+
+    const param = device.parameters.find(
+      (p) => p.name.toLowerCase() === change.param_name.toLowerCase(),
+    );
+    if (!param) {
+      console.warn(
+        `[AI Copilot] soundDesign: param "${change.param_name}" not found on "${device.name}" — skipping.`,
+      );
+      continue;
+    }
+
+    const clamped = Math.max(param.min, Math.min(param.max, change.value));
+    try {
+      await param.setValue(clamped);
+      changedCount++;
+      console.log(
+        `[AI Copilot] soundDesign: "${device.name}" → "${param.name}" = ${clamped.toFixed(3)} ` +
+        `(range [${param.min}, ${param.max}])`,
+      );
+    } catch (e) {
+      console.warn(`[AI Copilot] soundDesign: could not set "${param.name}" — ${(e as Error).message}`);
+    }
+  }
+
+  return changedCount;
+}
+
+// ─── Command: Sound design on a single device (Simpler / DrumRack scope) ──────
+
+async function soundDesignCommand(
+  context: ReturnType<typeof initialize>,
+  arg: unknown,
+): Promise<void> {
+  const song = context.application.song!;
+
+  // Resolve the device handle — could be Simpler or DrumRack
+  let targetDevice: Device<"1.0.0"> | null = null;
+  let sampleInfo = "";
+
+  try {
+    const simpler = context.getObjectFromHandle(arg as Handle, Simpler);
+    targetDevice = simpler;
+    const sample = simpler.sample;
+    if (sample) {
+      const fp   = sample.filePath;
+      const name = (fp.split("/").pop() ?? fp.split("\\").pop() ?? fp) || "unknown";
+      sampleInfo = `Loaded sample: "${name}"`;
+    }
+  } catch {
+    try {
+      targetDevice = context.getObjectFromHandle(arg as Handle, DrumRack);
+    } catch {
+      console.warn("[AI Copilot] soundDesign: handle is neither Simpler nor DrumRack.");
+      return;
+    }
+  }
+
+  if (!targetDevice) return;
+
+  const deviceName  = targetDevice.name;
+  const parentTrack = song.tracks.find((t) => t.devices.some((d) => d === targetDevice));
+  const trackName   = parentTrack?.name ?? "Unknown Track";
+
+  const rawResult = await context.ui.showModalDialog(
+    `data:text/html,${encodeURIComponent(promptUI)}`,
+    440, 300,
+  );
+  const { prompt } = JSON.parse(rawResult) as { prompt: string | null };
+  if (!prompt) return;
+
+  await context.ui.withinProgressDialog(
+    `AI Copilot — Sound Design: ${deviceName}…`,
+    {},
+    async (update, abortSignal) => {
+      update("Reading device parameters…", 15);
+
+      const sessionCtx  = buildSessionContext(song);
+      const paramStates = await readDeviceParams(targetDevice!);
+      const deviceText  = formatDeviceStates([{ name: deviceName, params: paramStates }]);
+      const soundSkill  = selectSkills({ role: "unknown", prompt });
+
+      update("Thinking…", 35);
+
+      const response = await runGeneration({
+        allowWeb: true,
+        onProgress: (l) => update(l, 55),
+        messages: [
+          {
+            role: "system",
+            content: [
+              "You are an expert sound designer inside Ableton Live.",
+              "You can read and write every parameter of a synthesizer or sampler device.",
+              "Your job: sculpt the sound to match the user's description.",
+              "",
+              "CRITICAL RULES:",
+              "1. Only adjust parameters that are relevant to the request. Leave others alone.",
+              "2. Values MUST be within the reported [min, max] range — the host will clamp but avoid it.",
+              "3. For quantized (enum) parameters, the value is the INTEGER INDEX into the options list.",
+              "4. Use exact device_name and param_name strings from the context below.",
+              "5. Think holistically — envelope + filter + modulation together shape the tone.",
+              "6. You MAY fetch a URL to research synthesis techniques before deciding.",
+              "",
+              "═══ SOUND DESIGN KNOWLEDGE ═══",
+              soundSkill,
+              "══════════════════════════════",
+            ].join("\n"),
+          },
+          {
+            role: "user",
+            content: [
+              sessionCtx,
+              "",
+              "╔══ TARGET DEVICE ════════════════════════════════════════",
+              `║  Track:  "${trackName}"`,
+              `║  Device: "${deviceName}"`,
+              ...(sampleInfo ? [`║  ${sampleInfo}`] : []),
+              "╠══ CURRENT PARAMETER STATE ══════════════════════════════",
+              deviceText,
+              "╚══════════════════════════════════════════════════════════",
+              "",
+              `USER REQUEST: "${prompt}"`,
+              "",
+              "Read the parameter list, plan your changes, then call set_device_params. " +
+              "Explain each choice in reasoning.",
+            ].join("\n"),
+          },
+        ],
+        tools: [SET_DEVICE_PARAMS_TOOL],
+        tool_choice: "required",
+      });
+
+      if (abortSignal.aborted) return;
+      update("Applying changes…", 80);
+
+      for (const call of response.choices[0]?.message?.tool_calls ?? []) {
+        if (call.function.name !== "set_device_params") continue;
+        const result = JSON.parse(call.function.arguments) as {
+          changes:   Array<{ device_name: string; param_name: string; value: number }>;
+          reasoning: string;
+        };
+        const n = await applyDeviceParamChanges(result.changes, [targetDevice!]);
+        console.log(
+          `[AI Copilot] soundDesign: ${n} param(s) changed on "${deviceName}".\n` +
+          `  Reasoning: ${result.reasoning}`,
+        );
+      }
+
+      update("Done!", 100);
+    },
+  );
+}
+
+// ─── Command: Sound design on ALL devices on a MIDI track ─────────────────────
+// Triggered from MidiTrack scope. Reads every device in the chain so the AI
+// can shape the instrument + every FX together (e.g. synth + reverb + saturator).
+
+async function soundDesignTrackCommand(
+  context: ReturnType<typeof initialize>,
+  arg: unknown,
+): Promise<void> {
+  const song  = context.application.song!;
+  const track = context.getObjectFromHandle(arg as Handle, MidiTrack);
+
+  if (track.devices.length === 0) {
+    console.warn("[AI Copilot] soundDesignTrack: no devices on this track.");
+    return;
+  }
+
+  const rawResult = await context.ui.showModalDialog(
+    `data:text/html,${encodeURIComponent(promptUI)}`,
+    440, 300,
+  );
+  const { prompt } = JSON.parse(rawResult) as { prompt: string | null };
+  if (!prompt) return;
+
+  await context.ui.withinProgressDialog(
+    `AI Copilot — Sound Design: "${track.name}" (${track.devices.length} devices)…`,
+    {},
+    async (update, abortSignal) => {
+      update("Reading all device parameters…", 15);
+
+      const sessionCtx   = buildSessionContext(song);
+      const deviceStates = await readAllDeviceStates(track.devices);
+      const devicesText  = formatDeviceStates(deviceStates);
+      const soundSkill   = selectSkills({ role: "unknown", prompt });
+
+      update("Thinking…", 35);
+
+      const response = await runGeneration({
+        allowWeb: true,
+        onProgress: (l) => update(l, 55),
+        messages: [
+          {
+            role: "system",
+            content: [
+              "You are an expert sound designer and mix engineer inside Ableton Live.",
+              "You have full access to every parameter in a track's complete device chain.",
+              "Your job: sculpt the combined sound (instrument + FX) to match the user's description.",
+              "",
+              "CRITICAL RULES:",
+              "1. You see ALL devices — instrument, effects, utilities. Shape them as a whole.",
+              "2. Values MUST be within [min, max]. For quantized params, value = integer index.",
+              "3. Use exact device_name and param_name strings from the context.",
+              "4. Only change what is relevant. Leave everything else untouched.",
+              "",
+              "═══ SOUND DESIGN KNOWLEDGE ═══",
+              soundSkill,
+              "══════════════════════════════",
+            ].join("\n"),
+          },
+          {
+            role: "user",
+            content: [
+              sessionCtx,
+              "",
+              "╔══ TARGET TRACK DEVICE CHAIN ═══════════════════════════",
+              `║  Track: "${track.name}"`,
+              `║  Chain: ${track.devices.map((d) => `"${d.name}"`).join(" → ")}`,
+              "╠══ CURRENT PARAMETER STATE ══════════════════════════════",
+              devicesText,
+              "╚══════════════════════════════════════════════════════════",
+              "",
+              `USER REQUEST: "${prompt}"`,
+              "",
+              "Read all devices above. Adjust instrument + FX together to achieve the described sound. " +
+              "Call set_device_params once with all changes. Explain each choice in reasoning.",
+            ].join("\n"),
+          },
+        ],
+        tools: [SET_DEVICE_PARAMS_TOOL],
+        tool_choice: "required",
+      });
+
+      if (abortSignal.aborted) return;
+      update("Applying changes…", 80);
+
+      for (const call of response.choices[0]?.message?.tool_calls ?? []) {
+        if (call.function.name !== "set_device_params") continue;
+        const result = JSON.parse(call.function.arguments) as {
+          changes:   Array<{ device_name: string; param_name: string; value: number }>;
+          reasoning: string;
+        };
+        const n = await applyDeviceParamChanges(result.changes, track.devices);
+        console.log(
+          `[AI Copilot] soundDesignTrack: ${n} param(s) changed on "${track.name}".\n` +
+          `  Reasoning: ${result.reasoning}`,
+        );
+      }
+
+      update("Done!", 100);
+    },
+  );
+}
+
 // ─── Command: Edit existing MIDI clip ─────────────────────────────────────────
 
 async function editClipCommand(
@@ -1178,9 +1589,13 @@ async function editClipCommand(
     const clipStart    = beatsToBar(clip.startTime, song.tempo);
     const totalBars    = Math.round(clip.duration / 4);
 
-    // Detect if this clip lives on a drum track
+    // Detect if this clip lives on a drum track.
+    // Must check BOTH arrangementClips AND clipSlots — the user may right-click a session-view clip.
     const parentTrack  = song.tracks.find((t) =>
-      t instanceof MidiTrack && t.arrangementClips.some((c) => c === clip),
+      t instanceof MidiTrack && (
+        t.arrangementClips.some((c) => c === clip) ||
+        t.clipSlots.some((cs) => cs.clip === clip)
+      )
     ) as MidiTrack<"1.0.0"> | undefined;
     const drumMode = parentTrack ? isDrumTrack(parentTrack) : false;
 
@@ -1894,15 +2309,21 @@ async function fillArrangementSelectionCommand(
             continue;
           }
 
-          const rawNotes = entry.notes as NoteDescription[];
-          const gapped   = enforceGaps(rawNotes, 0.125);
+          const rawNotes   = entry.notes as NoteDescription[];
+          const drumTrack  = isDrumTrack(track);
+          // Apply full validator pipeline for melody/bass tracks (scale snap, density, gaps, velocity).
+          // Drum tracks get their notes via the melody tool here so just enforce gaps (drum pitches
+          // are not in-key notes and shouldn't be scale-snapped).
+          const { notes: validatedNotes, report } = drumTrack
+            ? { notes: enforceGaps(rawNotes, 0.125), report: "drums: gaps only" }
+            : runMelodyValidators(rawNotes, song);
           const clip     = await track.createMidiClip(startBeat, duration);
           clip.name      = entry.clip_name;
-          clip.notes     = gapped;
-          clip.color     = clipColorForTrack(track.name, isDrumTrack(track));
+          clip.notes     = validatedNotes;
+          clip.color     = clipColorForTrack(track.name, drumTrack);
           console.log(
             `[AI Copilot] fillArrangement → "${track.name}": clip "${entry.clip_name}" ` +
-            `(${gapped.length} notes, ${totalBars} bars)\n  ${entry.phrase_plan}`,
+            `(${validatedNotes.length} notes, ${totalBars} bars)  [${report}]\n  ${entry.phrase_plan}`,
           );
         }
 
@@ -2045,10 +2466,12 @@ async function fillClipSlotSelectionCommand(
             if (call.function.name !== "set_notes") continue;
             const args     = JSON.parse(call.function.arguments);
             const rawNotes = args.notes as NoteDescription[];
-            const gapped   = enforceGaps(rawNotes, 0.125);
+            // Full validator pipeline: scale snap + density clamp + gap enforce + velocity humanize.
+            const { notes: validatedNotes, report } = runMelodyValidators(rawNotes, song);
             const clip     = await slot.createMidiClip(16);
-            clip.notes     = gapped;
+            clip.notes     = validatedNotes;
             clip.color     = clipColorForTrack(trackName, false);
+            console.log(`[AI Copilot] fillClipSlot "${trackName}": ${report}`);
           }
         }
 
@@ -2531,8 +2954,11 @@ async function buildArrangementCommand(
           clip.notes = expandDrumPattern(patternResult, entry.duration_beats);
           clip.color = CLIP_COLORS.drums;
         } else if (entry.notes && entry.notes.length > 0) {
-          clip.notes = enforceGaps(entry.notes as NoteDescription[], 0.125);
+          // Run full validator pipeline — scale snap, density clamp, gaps, velocity humanize.
+          const { notes: validated, report } = runMelodyValidators(entry.notes as NoteDescription[], song);
+          clip.notes = validated;
           clip.color = clipColorForTrack(track.name, false);
+          console.log(`[AI Copilot] buildArrangement validators: "${entry.clip_name}" → ${report}`);
         }
 
         console.log(
@@ -2574,26 +3000,42 @@ export function activate(activation: ActivationContext): void {
   context.commands.registerCommand("copilot.buildArrangement", () =>
     buildArrangementCommand(context).catch((e) => console.error("[AI Copilot] buildArrangement error:", e)),
   );
+  context.commands.registerCommand("copilot.soundDesign", (arg) =>
+    soundDesignCommand(context, arg).catch((e) => console.error("[AI Copilot] soundDesign error:", e)),
+  );
+  context.commands.registerCommand("copilot.soundDesignTrack", (arg) =>
+    soundDesignTrackCommand(context, arg).catch((e) => console.error("[AI Copilot] soundDesignTrack error:", e)),
+  );
 
-  // Single-object scopes
-  context.ui.registerContextMenuAction("MidiClip",  "🤖 AI: Edit this clip",        "copilot.editClip");
-  context.ui.registerContextMenuAction("MidiTrack", "🤖 AI: Generate clip",         "copilot.generateClip");
+  // Composition — MIDI clips and tracks
+  context.ui.registerContextMenuAction("MidiClip",  "🤖 AI: Edit this clip",               "copilot.editClip");
+  context.ui.registerContextMenuAction("MidiTrack", "🤖 AI: Generate clip",                "copilot.generateClip");
+  context.ui.registerContextMenuAction("MidiTrack", "🎛️ AI: Design sound (full chain)",    "copilot.soundDesignTrack");
 
-  // Scene scopes — multiple actions on the same scope
+  // Sound design — device scopes
+  context.ui.registerContextMenuAction("Simpler",  "🎛️ AI: Design sound",  "copilot.soundDesign");
+  context.ui.registerContextMenuAction("DrumRack", "🎛️ AI: Design sound",  "copilot.soundDesign");
+
+  // Scene scopes — session analysis + arrangement
   context.ui.registerContextMenuAction("Scene", "🤖 AI: Analyze full session",   "copilot.analyzeSession");
   context.ui.registerContextMenuAction("Scene", "🤖 AI: Rearrange clips",        "copilot.rearrangeArrangement");
   context.ui.registerContextMenuAction("Scene", "🤖 AI: Build arrangement",      "copilot.buildArrangement");
 
   // Multi-object / arrangement scopes
-  context.ui.registerContextMenuAction("MidiTrack.ArrangementSelection", "🤖 AI: Fill selection",       "copilot.fillArrangementSelection");
-  context.ui.registerContextMenuAction("ClipSlotSelection",              "🤖 AI: Fill selected slots",  "copilot.fillClipSlotSelection");
+  context.ui.registerContextMenuAction("MidiTrack.ArrangementSelection", "🤖 AI: Fill selection",      "copilot.fillArrangementSelection");
+  context.ui.registerContextMenuAction("ClipSlotSelection",              "🤖 AI: Fill selected slots", "copilot.fillClipSlotSelection");
 
   console.log(
-    `[AI Copilot] Loaded with ${MODEL}\n` +
+    `[AI Copilot] v0.3.0 loaded with ${MODEL}\n` +
+    `  ── Composition ──────────────────────────────────────────────\n` +
     `  • Right-click MIDI clip              → Edit this clip\n` +
     `  • Right-click MIDI track             → Generate clip\n` +
-    `  • Right-click Scene                  → Analyze / Rearrange / Build arrangement\n` +
     `  • Select arrangement region          → Fill selection (multi-track)\n` +
-    `  • Select multiple session view slots → Fill selected slots`,
+    `  • Select multiple session view slots → Fill selected slots\n` +
+    `  ── Sound Design ─────────────────────────────────────────────\n` +
+    `  • Right-click Simpler / DrumRack     → Design sound (single device)\n` +
+    `  • Right-click MIDI track             → Design sound (full chain)\n` +
+    `  ── Arrangement ──────────────────────────────────────────────\n` +
+    `  • Right-click Scene                  → Analyze / Rearrange / Build arrangement`,
   );
 }
