@@ -26,7 +26,7 @@ import skillMelody      from "./skills/melody.md";
 import skillBass        from "./skills/bass.md";
 import skillSoundDesign from "./skills/sound-design.md";
 
-const MODEL = "gpt-5.2";
+const MODEL = "gpt-5.5";
 
 // ─── Skill registry & selector ────────────────────────────────────────────────
 // Skills are externalized musical knowledge. The selector picks which skills to
