@@ -2,7 +2,7 @@
 
 > An Ableton Live 12 Extension that brings GPT-powered MIDI generation, editing, and session analysis directly into your right-click context menu.
 
-Built with the [Ableton Extensions SDK](https://github.com/ableton) (1.0.0-beta.0) · Powered by OpenAI · by **Samarth Mahendra**
+Built with the [Ableton Extensions SDK](https://github.com/ableton) (1.0.0-beta.0) · by **Samarth Mahendra**
 
 ---
 
