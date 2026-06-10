@@ -1507,6 +1507,51 @@ const SET_DEVICE_PARAMS_TOOL: ToolDef = {
   },
 };
 
+const INSERT_DEVICES_TOOL: ToolDef = {
+  type: "function",
+  function: {
+    name: "insert_devices",
+    description:
+      "Insert built-in Ableton Live devices into the track's device chain. " +
+      "Use this when the requested sound needs a device that is NOT in the chain yet " +
+      "(e.g. 'add a low cut' → insert EQ Eight; 'glue it together' → insert Glue Compressor). " +
+      "Only Live's native devices work. Exact names include: EQ Eight, EQ Three, Compressor, " +
+      "Glue Compressor, Saturator, Reverb, Delay, Echo, Auto Filter, Auto Pan, Utility, " +
+      "Chorus-Ensemble, Phaser-Flanger, Redux, Drum Buss, Limiter, Multiband Dynamics, Gate. " +
+      "After inserting, you receive the new devices' full parameter lists — " +
+      "THEN call set_device_params to configure them. Insert first, configure second.",
+    strict: true,
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      required: ["devices", "reasoning"],
+      properties: {
+        devices: {
+          type: "array",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            required: ["device_name", "index"],
+            properties: {
+              device_name: {
+                type: "string",
+                description: 'Exact built-in Live device name, e.g. "EQ Eight".',
+              },
+              index: {
+                type: "number",
+                description:
+                  "0-based position in the device chain. Use -1 to append at the end " +
+                  "(correct for most FX — after the instrument).",
+              },
+            },
+          },
+        },
+        reasoning: { type: "string", description: "Why these devices are needed for the requested sound." },
+      },
+    },
+  },
+};
+
 /**
  * Apply a set_device_params result against a list of available devices.
  * Does case-insensitive matching on both device name and param name.
@@ -1715,65 +1760,129 @@ async function soundDesignTrackCommand(
 
       update("Thinking…", 35);
 
-      const response = await runGeneration({
-        allowWeb: true,
-        onProgress: (l) => update(l, 55),
-        messages: [
-          {
-            role: "system",
-            content: [
-              "You are an expert sound designer and mix engineer inside Ableton Live.",
-              "You have full access to every parameter in a track's complete device chain.",
-              "Your job: sculpt the combined sound (instrument + FX) to match the user's description.",
-              "",
-              "CRITICAL RULES:",
-              "1. You see ALL devices — instrument, effects, utilities. Shape them as a whole.",
-              "2. Values MUST be within [min, max]. For quantized params, value = integer index.",
-              "3. Use exact device_name and param_name strings from the context.",
-              "4. Only change what is relevant. Leave everything else untouched.",
-              "",
-              "═══ SOUND DESIGN KNOWLEDGE ═══",
-              soundSkill,
-              "══════════════════════════════",
-            ].join("\n"),
-          },
-          {
-            role: "user",
-            content: [
-              sessionCtx,
-              "",
-              "╔══ TARGET TRACK DEVICE CHAIN ═══════════════════════════",
-              `║  Track: "${track.name}"`,
-              `║  Chain: ${track.devices.map((d) => `"${d.name}"`).join(" → ")}`,
-              "╠══ CURRENT PARAMETER STATE ══════════════════════════════",
-              devicesText,
-              "╚══════════════════════════════════════════════════════════",
-              "",
-              `USER REQUEST: "${prompt}"`,
-              "",
-              "Read all devices above. Adjust instrument + FX together to achieve the described sound. " +
-              "Call set_device_params once with all changes. Explain each choice in reasoning.",
-            ].join("\n"),
-          },
-        ],
-        tools: [SET_DEVICE_PARAMS_TOOL],
-        tool_choice: "required",
-      });
+      const messages: Message[] = [
+        {
+          role: "system",
+          content: [
+            "You are an expert sound designer and mix engineer inside Ableton Live.",
+            "You have full access to every parameter in a track's complete device chain.",
+            "Your job: sculpt the combined sound (instrument + FX) to match the user's description.",
+            "",
+            "You have TWO tools:",
+            "• insert_devices — add built-in Live devices the chain is missing (EQ Eight,",
+            "  Compressor, Reverb…). After inserting you receive the new parameters.",
+            "• set_device_params — change parameter values on devices in the chain.",
+            "If the request needs a device that isn't in the chain (e.g. 'add a low cut'",
+            "but there is no EQ), insert it FIRST, then configure it in the next step.",
+            "",
+            "CRITICAL RULES:",
+            "1. You see ALL devices — instrument, effects, utilities. Shape them as a whole.",
+            "2. Values MUST be within [min, max]. For quantized params, value = integer index.",
+            "3. Use exact device_name and param_name strings from the context.",
+            "4. Only change what is relevant. Leave everything else untouched.",
+            "5. Never call set_device_params for a device you have not yet seen the parameters of.",
+            "",
+            "═══ SOUND DESIGN KNOWLEDGE ═══",
+            soundSkill,
+            "══════════════════════════════",
+          ].join("\n"),
+        },
+        {
+          role: "user",
+          content: [
+            sessionCtx,
+            "",
+            "╔══ TARGET TRACK DEVICE CHAIN ═══════════════════════════",
+            `║  Track: "${track.name}"`,
+            `║  Chain: ${track.devices.map((d) => `"${d.name}"`).join(" → ")}`,
+            "╠══ CURRENT PARAMETER STATE ══════════════════════════════",
+            devicesText,
+            "╚══════════════════════════════════════════════════════════",
+            "",
+            `USER REQUEST: "${prompt}"`,
+            "",
+            "Read all devices above. If the chain is missing a device the request needs, " +
+            "insert it first. Then adjust instrument + FX together to achieve the described " +
+            "sound with one set_device_params call. Explain each choice in reasoning.",
+          ].join("\n"),
+        },
+      ];
 
-      if (abortSignal.aborted) return;
-      update("Applying changes…", 80);
+      // Insert→configure loop: the model may insert devices (receiving their fresh
+      // parameter lists back) before committing parameter changes. Capped rounds;
+      // the final round withholds insert_devices to force configuration.
+      const MAX_ROUNDS = 4;
+      let configured = false;
 
-      for (const call of response.choices[0]?.message?.tool_calls ?? []) {
-        if (call.function.name !== "set_device_params") continue;
-        const result = JSON.parse(call.function.arguments) as {
-          changes:   Array<{ device_name: string; param_name: string; value: number }>;
-          reasoning: string;
-        };
-        const n = await applyDeviceParamChanges(result.changes, track.devices);
-        console.log(
-          `[AI Copilot] soundDesignTrack: ${n} param(s) changed on "${track.name}".\n` +
-          `  Reasoning: ${result.reasoning}`,
-        );
+      for (let round = 0; round < MAX_ROUNDS && !configured; round++) {
+        if (abortSignal.aborted) return;
+
+        const tools = round < MAX_ROUNDS - 1
+          ? [INSERT_DEVICES_TOOL, SET_DEVICE_PARAMS_TOOL]
+          : [SET_DEVICE_PARAMS_TOOL];
+        const response = await chatCompletion({ messages, tools, tool_choice: "required" });
+        const msg   = response.choices[0]?.message;
+        const calls = msg?.tool_calls ?? [];
+        if (calls.length === 0) break;
+
+        messages.push({ role: "assistant", content: msg?.content ?? null, tool_calls: calls });
+
+        for (const call of calls) {
+          if (call.function.name === "insert_devices") {
+            const args = JSON.parse(call.function.arguments) as {
+              devices:   Array<{ device_name: string; index: number }>;
+              reasoning: string;
+            };
+            const resultLines: string[] = [];
+            let anyInserted = false;
+
+            for (const d of args.devices) {
+              const idx = d.index < 0 || d.index > track.devices.length
+                ? track.devices.length
+                : Math.round(d.index);
+              update(`Inserting ${d.device_name}…`, 55);
+              try {
+                await track.insertDevice(d.device_name, idx);
+                anyInserted = true;
+                resultLines.push(`Inserted "${d.device_name}" at chain position ${idx}.`);
+                console.log(`[AI Copilot] soundDesignTrack: inserted "${d.device_name}" at index ${idx} on "${track.name}". Reason: ${args.reasoning}`);
+              } catch (e) {
+                resultLines.push(
+                  `FAILED to insert "${d.device_name}": ${(e as Error).message}. ` +
+                  "Check it is an exact built-in Live device name.",
+                );
+                console.warn(`[AI Copilot] soundDesignTrack: insert "${d.device_name}" failed — ${(e as Error).message}`);
+              }
+            }
+
+            if (anyInserted) {
+              update("Reading new device parameters…", 65);
+              const newStates = await readAllDeviceStates(track.devices);
+              resultLines.push("", "Updated device chain with full parameters:", "", formatDeviceStates(newStates));
+              resultLines.push("", "Now call set_device_params to configure the chain.");
+            }
+            messages.push({
+              role: "tool",
+              tool_call_id: call.id,
+              name: "insert_devices",
+              content: resultLines.join("\n"),
+            });
+          }
+
+          if (call.function.name === "set_device_params") {
+            update("Applying changes…", 80);
+            const result = JSON.parse(call.function.arguments) as {
+              changes:   Array<{ device_name: string; param_name: string; value: number }>;
+              reasoning: string;
+            };
+            const n = await applyDeviceParamChanges(result.changes, track.devices);
+            configured = true;
+            console.log(
+              `[AI Copilot] soundDesignTrack: ${n} param(s) changed on "${track.name}".\n` +
+              `  Reasoning: ${result.reasoning}`,
+            );
+          }
+        }
       }
 
       update("Done!", 100);
