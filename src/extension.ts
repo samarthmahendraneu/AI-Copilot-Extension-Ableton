@@ -22,6 +22,7 @@ import skillCore        from "./skills/_core.md";
 import skillDrums       from "./skills/drums.md";
 import skillHipHop      from "./skills/hiphop.md";
 import skillHouse       from "./skills/house.md";
+import skillReggaeton   from "./skills/reggaeton.md";
 import skillMelody      from "./skills/melody.md";
 import skillBass        from "./skills/bass.md";
 import skillSoundDesign from "./skills/sound-design.md";
@@ -44,6 +45,7 @@ const SKILLS: Skill[] = [
   { id: "drums",       content: skillDrums,       keywords: /drum|beat|kick|snare|hat|hi-?hat|percussion|groove|fill|808|clap/i },
   { id: "hiphop",      content: skillHipHop,      keywords: /hip.?hop|boom.?bap|trap|lo.?fi|lofi|rap|drill|j.?dilla|mpc/i },
   { id: "house",       content: skillHouse,       keywords: /house|techno|four.?on.?the.?floor|deep house|tech house|edm|dance|club|rave/i },
+  { id: "reggaeton",   content: skillReggaeton,   keywords: /reggaeton|dembow|perreo|urbano|latin.?urban|rkt|bad.?bunny|j.?balvin|maluma|latin.?trap|latino/i },
   { id: "melody",      content: skillMelody,      keywords: /melod|lead|hook|topline|riff|chord|harmon|progression|counter|arp/i },
   { id: "bass",        content: skillBass,        keywords: /bass|808|sub|low.?end|bassline/i },
   { id: "sound-design", content: skillSoundDesign, keywords: /warm|bright|dark|dusty|gritty|punch|airy|pad|pluck|smooth|glassy|metallic|bell|sub|lead|synth|sound.?design|wavetable|operator|simpler|filter|cutoff|reverb|delay|attack|decay|sustain|release|envelope|lfo|resonan|saturat|compress/i },
@@ -80,7 +82,7 @@ function selectSkills(opts: { role: TrackRole; prompt: string }): string {
   }
 
   // Assemble: _core first, then the selected packs in a stable order
-  const order = ["drums", "bass", "melody", "hiphop", "house", "sound-design"];
+  const order = ["drums", "bass", "melody", "hiphop", "house", "reggaeton", "sound-design"];
   const parts = [skillCore];
   for (const id of order) {
     if (chosen.has(id)) {
