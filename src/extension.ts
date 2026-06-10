@@ -9,6 +9,7 @@ import {
   ClipSlot,
   Device,
   Simpler,
+  RackDevice,
   type ActivationContext,
   type Handle,
   type NoteDescription,
@@ -425,9 +426,54 @@ interface DrumPatternResult {
   reasoning:       string;
 }
 
-/** True if the track has a DrumRack device loaded */
+/**
+ * Find the DrumRack on a track, looking INSIDE Instrument/audio-effect Racks.
+ * Ableton pack kits (e.g. "1-Sticks Kit") are frequently an Instrument Rack
+ * wrapping a DrumRack — a top-level-only check misses them, which silently
+ * routes drum tracks down the melody path (scale snap + density clamp then
+ * destroy the pattern).
+ */
+function findDrumRack(
+  devices: Device<"1.0.0">[],
+  depth = 0,
+): DrumRack<"1.0.0"> | null {
+  if (depth > 4) return null; // racks can nest; don't recurse forever
+  for (const device of devices) {
+    if (device instanceof DrumRack) return device;
+    if (device instanceof RackDevice) {
+      for (const chain of device.chains) {
+        const found = findDrumRack(chain.devices, depth + 1);
+        if (found) return found;
+      }
+    }
+  }
+  return null;
+}
+
+/** True if the track has a DrumRack device loaded (including nested in Racks) */
 function isDrumTrack(track: MidiTrack<"1.0.0">): boolean {
-  return track.devices.some((d) => d instanceof DrumRack);
+  return findDrumRack(track.devices) !== null;
+}
+
+/**
+ * Log how a track was classified (drum vs melodic) and why — device class
+ * names included. This is the breadcrumb for diagnosing routing mistakes
+ * like a drum clip being generated through the melody pipeline.
+ */
+function logTrackRouting(tag: string, track: MidiTrack<"1.0.0"> | undefined): void {
+  if (!track) {
+    console.warn(
+      `[AI Copilot] ⚠️ ${tag}: parent track NOT FOUND — falling back to the melody pipeline. ` +
+      `If this clip is on a drum track, the pattern will be scale-snapped and density-clamped (bad).`,
+    );
+    return;
+  }
+  const deviceNames = track.devices.map((d) => d.constructor?.name ?? "Device").join(", ") || "(no devices)";
+  const drum = isDrumTrack(track);
+  console.log(
+    `[AI Copilot] ${tag}: track "${track.name}" routed as ${drum ? "DRUMS" : "MELODIC"} ` +
+    `(top-level devices: ${deviceNames})`,
+  );
 }
 
 /**
@@ -441,8 +487,8 @@ function isDrumTrack(track: MidiTrack<"1.0.0">): boolean {
  * Falls back to the generic GM map if no DrumRack is found.
  */
 function readDrumPadMap(track: MidiTrack<"1.0.0">): string {
-  const drumRack = track.devices.find((d) => d instanceof DrumRack);
-  if (!(drumRack instanceof DrumRack) || drumRack.chains.length === 0) {
+  const drumRack = findDrumRack(track.devices);
+  if (!drumRack || drumRack.chains.length === 0) {
     return GM_DRUM_MAP; // fallback
   }
 
@@ -482,8 +528,8 @@ function logDrumPadUsage(
 ): void {
   // Build pitch → pad-name map from the track's DrumRack (if present)
   const padNames = new Map<number, string>();
-  const drumRack = track?.devices.find((d) => d instanceof DrumRack);
-  if (drumRack instanceof DrumRack) {
+  const drumRack = track ? findDrumRack(track.devices) : null;
+  if (drumRack) {
     for (const chain of drumRack.chains) {
       const label = (((chain as unknown) as { name?: string }).name ?? "").trim();
       padNames.set(chain.receivingNote, label || "(unnamed pad)");
@@ -1711,6 +1757,7 @@ async function editClipCommand(
       )
     ) as MidiTrack<"1.0.0"> | undefined;
     const drumMode = parentTrack ? isDrumTrack(parentTrack) : false;
+    logTrackRouting("editClip", parentTrack);
 
     // Build sibling context: what other tracks are playing in this same region
     const siblingCtx = buildSiblingContext(
@@ -1926,6 +1973,7 @@ async function generateClipCommand(
 
     const sessionCtx = buildSessionContext(song);
     const drumMode   = isDrumTrack(track);
+    logTrackRouting("generateClip", track);
 
     // For a new clip we default to placing at beat 0 for 16 beats (4 bars) —
     // the AI may override startTime in its tool call. Use that range for sibling context.
@@ -2531,6 +2579,7 @@ async function fillClipSlotSelectionCommand(
 
         const trackName  = parentTrack?.name ?? "Unknown Track";
         const drumMode   = parentTrack ? isDrumTrack(parentTrack) : false;
+        logTrackRouting("fillClipSlot", parentTrack);
 
         update(`Generating for "${trackName}"… (${done + 1}/${slots.length})`, 30 + (done / slots.length) * 50);
 
