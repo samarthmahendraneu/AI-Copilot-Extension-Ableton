@@ -390,6 +390,69 @@ async function runGeneration(opts: {
   return chatCompletion({ messages, tools: opts.tools, tool_choice: opts.tool_choice ?? "required" });
 }
 
+// ─── Generic agentic loop ─────────────────────────────────────────────────────
+// Unlike runGeneration (which stops at the first "terminal" tool call), runAgent
+// executes EVERY tool call through a handler, feeds the result back, and loops
+// until the model stops calling tools — i.e. until it decides the user's whole
+// request is fulfilled. This is what lets one prompt chain multiple actions:
+// "generate hip hop drums and add glue and saturation" → create_drum_clip →
+// insert_devices → set_device_params → final text summary.
+
+interface AgentTool {
+  def: ToolDef;
+  /** Execute the call and return the string fed back to the model as the tool result. */
+  handler: (args: Record<string, unknown>) => Promise<string>;
+}
+
+async function runAgent(opts: {
+  messages: Message[];
+  tools: AgentTool[];
+  maxIterations?: number;
+  onProgress?: (label: string) => void;
+  abortSignal?: { aborted: boolean };
+}): Promise<string | null> {
+  const messages = [...opts.messages];
+  const defs     = opts.tools.map((t) => t.def);
+  const max      = opts.maxIterations ?? 10;
+
+  for (let iter = 0; iter < max; iter++) {
+    if (opts.abortSignal?.aborted) return null;
+
+    // First round must act; afterwards the model may stop (text = goal reached).
+    const tool_choice = iter === 0 ? "required" : "auto";
+    const response = await chatCompletion({ messages, tools: defs, tool_choice });
+    const msg   = response.choices[0]?.message;
+    const calls = msg?.tool_calls ?? [];
+
+    if (calls.length === 0) {
+      console.log(`[AI Copilot] agent finished after ${iter} step(s): ${msg?.content ?? "(no summary)"}`);
+      return msg?.content ?? null;
+    }
+
+    messages.push({ role: "assistant", content: msg?.content ?? null, tool_calls: calls });
+
+    for (const call of calls) {
+      if (opts.abortSignal?.aborted) return null;
+      const tool = opts.tools.find((t) => t.def.function.name === call.function.name);
+      let content: string;
+      try {
+        const args = JSON.parse(call.function.arguments) as Record<string, unknown>;
+        content = tool
+          ? await tool.handler(args)
+          : `Unknown tool "${call.function.name}" — available: ${defs.map((d) => d.function.name).join(", ")}`;
+      } catch (e) {
+        content = `Tool "${call.function.name}" failed: ${(e as Error).message}`;
+        console.warn(`[AI Copilot] agent tool ${call.function.name} error: ${(e as Error).message}`);
+      }
+      console.log(`[AI Copilot] agent step ${iter + 1}: ${call.function.name} → ${content.split("\n")[0]}`);
+      messages.push({ role: "tool", tool_call_id: call.id, name: call.function.name, content });
+    }
+  }
+
+  console.warn(`[AI Copilot] agent hit the ${max}-iteration cap — stopping.`);
+  return null;
+}
+
 // ─── Drum helpers ─────────────────────────────────────────────────────────────
 
 const GM_DRUM_MAP = `
@@ -1599,6 +1662,106 @@ async function applyDeviceParamChanges(
   return changedCount;
 }
 
+// ─── Agent tool factories ─────────────────────────────────────────────────────
+// Bundles of AgentTools (def + handler) bound to a specific track, for use with
+// runAgent. Lets generation commands chain MIDI work with device/FX work.
+
+const READ_DEVICE_PARAMS_TOOL: ToolDef = {
+  type: "function",
+  function: {
+    name: "read_device_params",
+    description:
+      "Read the current state of every device on the track: device names and all " +
+      "parameters with [min, max] ranges and current values. Call this BEFORE " +
+      "set_device_params if you have not yet seen the chain's parameters.",
+    strict: true,
+    parameters: { type: "object", additionalProperties: false, required: [], properties: {} },
+  },
+};
+
+/** Device tools (read / insert / configure) bound to one track. */
+function makeDeviceAgentTools(
+  track: MidiTrack<"1.0.0">,
+  update: (label: string, pct?: number) => void,
+): AgentTool[] {
+  return [
+    {
+      def: READ_DEVICE_PARAMS_TOOL,
+      handler: async () => {
+        update("Reading device parameters…");
+        const states = await readAllDeviceStates(track.devices);
+        return [
+          `Device chain on "${track.name}": ${track.devices.map((d) => `"${d.name}"`).join(" → ") || "(empty)"}`,
+          "",
+          formatDeviceStates(states),
+        ].join("\n");
+      },
+    },
+    {
+      def: INSERT_DEVICES_TOOL,
+      handler: async (args) => {
+        const input = args as unknown as {
+          devices: Array<{ device_name: string; index: number }>;
+          reasoning: string;
+        };
+        const lines: string[] = [];
+        let anyInserted = false;
+        for (const d of input.devices) {
+          const idx = d.index < 0 || d.index > track.devices.length
+            ? track.devices.length
+            : Math.round(d.index);
+          update(`Inserting ${d.device_name}…`);
+          try {
+            await track.insertDevice(d.device_name, idx);
+            anyInserted = true;
+            lines.push(`Inserted "${d.device_name}" at chain position ${idx}.`);
+            console.log(`[AI Copilot] agent: inserted "${d.device_name}" at index ${idx} on "${track.name}". Reason: ${input.reasoning}`);
+          } catch (e) {
+            lines.push(
+              `FAILED to insert "${d.device_name}": ${(e as Error).message}. ` +
+              "Check it is an exact built-in Live device name.",
+            );
+            console.warn(`[AI Copilot] agent: insert "${d.device_name}" failed — ${(e as Error).message}`);
+          }
+        }
+        if (anyInserted) {
+          const states = await readAllDeviceStates(track.devices);
+          lines.push("", "Updated device chain with full parameters:", "", formatDeviceStates(states));
+          lines.push("", "Now call set_device_params to configure the new devices.");
+        }
+        return lines.join("\n");
+      },
+    },
+    {
+      def: SET_DEVICE_PARAMS_TOOL,
+      handler: async (args) => {
+        const input = args as unknown as {
+          changes:   Array<{ device_name: string; param_name: string; value: number }>;
+          reasoning: string;
+        };
+        update("Applying device parameters…");
+        const n = await applyDeviceParamChanges(input.changes, track.devices);
+        console.log(`[AI Copilot] agent: ${n} param(s) changed on "${track.name}". Reasoning: ${input.reasoning}`);
+        return `Applied ${n} of ${input.changes.length} parameter change(s).`;
+      },
+    },
+  ];
+}
+
+/** Web access as an AgentTool, for use with runAgent. */
+function makeFetchUrlAgentTool(update: (label: string, pct?: number) => void): AgentTool {
+  return {
+    def: FETCH_URL_TOOL,
+    handler: async (args) => {
+      const { url } = args as { url: string };
+      update(`Reading ${new URL(url).hostname}…`);
+      const text = await httpGetText(url);
+      const trimmed = text.length > 12_000 ? text.slice(0, 12_000) + "\n…(truncated)" : text;
+      return `Fetched ${url}:\n\n${trimmed}`;
+    },
+  };
+}
+
 // ─── Command: Sound design on a single device (Simpler / DrumRack scope) ──────
 
 async function soundDesignCommand(
@@ -2224,14 +2387,56 @@ async function generateClipCommand(
         },
       };
 
-      const response = await runGeneration({
-        allowWeb: true,
+      const createDrumClipAgentTool: AgentTool = {
+        def: createDrumTool,
+        handler: async (args) => {
+          const input = args as unknown as {
+            startTime: number; duration: number; clipName: string;
+            base_pattern: { hits: DrumHit[] };
+            variation_bars: Array<{ bar_index: number; hits: DrumHit[] }>;
+            reasoning: string;
+          };
+          const patternResult: DrumPatternResult = {
+            base_pattern:   input.base_pattern,
+            variation_bars: input.variation_bars,
+            reasoning:      input.reasoning,
+          };
+          update(`Creating "${input.clipName}"…`, 60);
+          const clip  = await track.createMidiClip(input.startTime, input.duration);
+          clip.name   = input.clipName;
+          clip.notes  = expandDrumPattern(patternResult, input.duration);
+          clip.color  = CLIP_COLORS.drums;
+          logDrumGeneration(
+            `generateClip "${input.clipName}" (${clip.notes.length} notes, ${Math.round(input.duration / 4)} bars)`,
+            patternResult,
+            track,
+          );
+          return `Created drum clip "${input.clipName}" — ${clip.notes.length} notes across ${Math.round(input.duration / 4)} bars at beat ${input.startTime}.`;
+        },
+      };
+
+      await runAgent({
+        abortSignal,
         onProgress: (l) => update(l, 45),
+        tools: [
+          createDrumClipAgentTool,
+          ...makeDeviceAgentTools(track, update),
+          makeFetchUrlAgentTool(update),
+        ],
         messages: [
           {
             role: "system",
             content: [
-              "You are a professional drum programmer inside Ableton Live.",
+              "You are a professional drum programmer and mix engineer agent inside Ableton Live.",
+              "Fulfill the user's ENTIRE request step by step using your tools:",
+              "• create_drum_clip — write the MIDI pattern (usually the first step)",
+              "• read_device_params / insert_devices / set_device_params — device & FX work",
+              "  (e.g. 'add glue and saturation' → insert Glue Compressor + Saturator, then configure)",
+              "• fetch_url — research references the user points you to",
+              "Work in order: MIDI first, then devices. When EVERYTHING the user asked for is done,",
+              "reply with a one-paragraph text summary and NO further tool calls.",
+              "If the request is only about MIDI, do not touch devices.",
+              "",
               "Use create_drum_clip with ONE base bar that repeats perfectly every bar.",
               "This guarantees kick/snare lock — no drift across bars.",
               "Only override via variation_bars for fills on bar 4, 8, etc.",
@@ -2276,40 +2481,12 @@ async function generateClipCommand(
               "",
               "Study the beat grids / note positions of the existing tracks above first. " +
               "Then define a base bar where the kick locks to the bass, and hi-hats leave room for the melody. " +
-              "The code handles repetition — just define one tight bar.",
+              "The code handles repetition — just define one tight bar. " +
+              "After the clip is written, handle any device/FX part of the request before finishing.",
             ].join("\n"),
           },
         ],
-        tools: [createDrumTool],
-        tool_choice: "required",
       });
-
-      if (abortSignal.aborted) return;
-      update("Creating drum clip…", 80);
-
-      for (const call of response.choices[0]?.message?.tool_calls ?? []) {
-        if (call.function.name !== "create_drum_clip") continue;
-        const input = JSON.parse(call.function.arguments) as {
-          startTime: number; duration: number; clipName: string;
-          base_pattern: { hits: DrumHit[] };
-          variation_bars: Array<{ bar_index: number; hits: DrumHit[] }>;
-          reasoning: string;
-        };
-        const patternResult: DrumPatternResult = {
-          base_pattern:   input.base_pattern,
-          variation_bars: input.variation_bars,
-          reasoning:      input.reasoning,
-        };
-        const clip  = await track.createMidiClip(input.startTime, input.duration);
-        clip.name   = input.clipName;
-        clip.notes  = expandDrumPattern(patternResult, input.duration);
-        clip.color  = CLIP_COLORS.drums;
-        logDrumGeneration(
-          `generateClip "${input.clipName}" (${clip.notes.length} notes, ${Math.round(input.duration / 4)} bars)`,
-          patternResult,
-          track,
-        );
-      }
 
     // ── Melody / chord / bass track ───────────────────────────────────────
     } else {
@@ -2358,15 +2535,51 @@ async function generateClipCommand(
         },
       };
 
-      const response = await runGeneration({
-        allowWeb: true,
+      const createClipAgentTool: AgentTool = {
+        def: createClipTool,
+        handler: async (args) => {
+          const input = args as unknown as {
+            startTime: number; duration: number; clipName: string;
+            phrase_plan: string; notes: NoteDescription[]; reasoning: string;
+          };
+          const { notes, report } = runMelodyValidators(input.notes, song, {
+            maxPerBar: role === "chords" ? 16 : role === "bass" ? 10 : 8,
+          });
+          update(`Creating "${input.clipName}"…`, 60);
+          const clip = await track.createMidiClip(input.startTime, input.duration);
+          clip.name  = input.clipName;
+          clip.notes = notes;
+          clip.color = clipColorForTrack(track.name, false);
+          console.log(
+            `[AI Copilot] Created "${input.clipName}" (${input.duration} beats) — ${report}.\n` +
+            `  Phrase plan: ${input.phrase_plan}\n  Reasoning: ${input.reasoning}`,
+          );
+          return `Created clip "${input.clipName}" — ${notes.length} notes, ${input.duration} beats at beat ${input.startTime} (validators: ${report}).`;
+        },
+      };
+
+      await runAgent({
+        abortSignal,
         onProgress: (l) => update(l, 45),
+        tools: [
+          createClipAgentTool,
+          ...makeDeviceAgentTools(track, update),
+          makeFetchUrlAgentTool(update),
+        ],
         messages: [
           {
             role: "system",
             content: [
-              "You are an expert music producer and composer inside Ableton Live.",
+              "You are an expert music producer, composer, and mix engineer agent inside Ableton Live.",
               "You can see the full session — all tracks, clips, devices, and mixer state.",
+              "Fulfill the user's ENTIRE request step by step using your tools:",
+              "• create_clip — write the MIDI (usually the first step)",
+              "• read_device_params / insert_devices / set_device_params — device & FX work",
+              "  (e.g. 'add reverb and a low cut' → insert Reverb + EQ Eight, then configure)",
+              "• fetch_url — research references the user points you to",
+              "Work in order: MIDI first, then devices. When EVERYTHING the user asked for is done,",
+              "reply with a one-paragraph text summary and NO further tool calls.",
+              "If the request is only about MIDI, do not touch devices.",
               "",
               "CRITICAL: Read the existing arrangement content shown below BEFORE writing any notes.",
               "If drums exist: look at the kick/snare positions and fit your rhythm around them.",
@@ -2399,35 +2612,12 @@ async function generateClipCommand(
               "",
               "Study the existing content in this region first — beat grids, note positions, pitches. " +
               "Then fill phrase_plan and write notes that lock in with what's already there. " +
-              "Sparse phrasing — rests are as important as notes.",
+              "Sparse phrasing — rests are as important as notes. " +
+              "After the clip is written, handle any device/FX part of the request before finishing.",
             ].join("\n"),
           },
         ],
-        tools: [createClipTool],
-        tool_choice: "required",
       });
-
-      if (abortSignal.aborted) return;
-      update("Creating clip in Live…", 80);
-
-      for (const call of response.choices[0]?.message?.tool_calls ?? []) {
-        if (call.function.name !== "create_clip") continue;
-        const input = JSON.parse(call.function.arguments) as {
-          startTime: number; duration: number; clipName: string;
-          phrase_plan: string; notes: NoteDescription[]; reasoning: string;
-        };
-        const { notes, report } = runMelodyValidators(input.notes, song, {
-          maxPerBar: role === "chords" ? 16 : role === "bass" ? 10 : 8,
-        });
-        const clip = await track.createMidiClip(input.startTime, input.duration);
-        clip.name  = input.clipName;
-        clip.notes = notes;
-        clip.color = clipColorForTrack(track.name, false);
-        console.log(
-          `[AI Copilot] Created "${input.clipName}" (${input.duration} beats) — ${report}.\n` +
-          `  Phrase plan: ${input.phrase_plan}\n  Reasoning: ${input.reasoning}`,
-        );
-      }
     }
 
     update("Done!", 100);
