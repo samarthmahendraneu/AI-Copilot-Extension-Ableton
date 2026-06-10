@@ -10,6 +10,7 @@ import {
   Device,
   Simpler,
   RackDevice,
+  DrumChain,
   type ActivationContext,
   type Handle,
   type NoteDescription,
@@ -486,6 +487,42 @@ function logTrackRouting(tag: string, track: MidiTrack<"1.0.0"> | undefined): vo
  *   ...
  * Falls back to the generic GM map if no DrumRack is found.
  */
+/**
+ * Find the sample loaded in a pad by walking its devices for a Simpler
+ * (descending into nested racks). Returns the sample file's base name,
+ * e.g. "Kick-808-SubLong", or null if no sample is found.
+ */
+function findPadSampleName(devices: Device<"1.0.0">[], depth = 0): string | null {
+  if (depth > 3) return null;
+  for (const device of devices) {
+    if (device instanceof Simpler && device.sample) {
+      const file = device.sample.filePath.split(/[\\/]/).pop() ?? "";
+      const base = file.replace(/\.[^.]+$/, "").trim();
+      if (base) return base;
+    }
+    if (device instanceof RackDevice) {
+      for (const chain of device.chains) {
+        const found = findPadSampleName(chain.devices, depth + 1);
+        if (found) return found;
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Human-readable label for a drum pad. SDK chains have NO name property —
+ * the label must come from the devices inside the pad: the loaded sample's
+ * file name first, then the instrument device's name, else "(empty pad)".
+ */
+function describeDrumPad(chain: DrumChain<"1.0.0">): string {
+  const sampleName = findPadSampleName(chain.devices);
+  if (sampleName) return sampleName;
+  const deviceName = (chain.devices[0]?.name ?? "").trim();
+  if (deviceName) return deviceName;
+  return "(empty pad)";
+}
+
 // Tracks the last pad map logged per track so the console shows the pad info
 // once per kit (and again whenever the kit changes), not on every prompt build.
 const lastLoggedPadMaps = new Map<string, string>();
@@ -511,11 +548,10 @@ function readDrumPadMap(track: MidiTrack<"1.0.0">): string {
   const sorted = [...drumRack.chains].sort((a, b) => a.receivingNote - b.receivingNote);
 
   for (const chain of sorted) {
+    if (chain.devices.length === 0) continue; // empty pad — no sound, don't offer it to the model
     const note  = chain.receivingNote;
     const name  = pitchToName(note);
-    // DrumChain has a runtime .name property that TypeScript types don't expose — cast to access it.
-    const label = (((chain as unknown) as { name?: string }).name ?? "").trim() || "(unnamed pad)";
-    lines.push(`  ${note.toString().padStart(3)} (${name.padEnd(4)}) = ${label}`);
+    lines.push(`  ${note.toString().padStart(3)} (${name.padEnd(4)}) = ${describeDrumPad(chain)}`);
   }
 
   lines.push("");
@@ -552,8 +588,8 @@ function logDrumPadUsage(
   const drumRack = track ? findDrumRack(track.devices) : null;
   if (drumRack) {
     for (const chain of drumRack.chains) {
-      const label = (((chain as unknown) as { name?: string }).name ?? "").trim();
-      padNames.set(chain.receivingNote, label || "(unnamed pad)");
+      if (chain.devices.length === 0) continue; // empty pads aren't valid targets
+      padNames.set(chain.receivingNote, describeDrumPad(chain));
     }
   }
 
