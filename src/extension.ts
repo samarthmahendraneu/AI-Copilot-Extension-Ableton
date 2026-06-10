@@ -484,6 +484,29 @@ function expandDrumPattern(
       }
     }
 
+    // Safety net: deduplicate snare-family stacking at the same beat.
+    // GM snare family: 37 (Side Stick), 38 (Acoustic Snare), 39 (Clap), 40 (Electric Snare).
+    // If two pitches from this family land at the same beat (within 0.005 beats), the lower-
+    // velocity one is dropped — two snare-type sounds at the same position create phasing/doubling.
+    const SNARE_FAMILY = new Set([37, 38, 39, 40]);
+    const snareFamilyByBeat = new Map<string, DrumHit>(); // beatKey → winning hit
+    for (const [key, hit] of seen) {
+      const roundedPitch = Math.round(hit.pitch);
+      if (!SNARE_FAMILY.has(roundedPitch)) continue;
+      const beatKey = hit.beat.toFixed(3);
+      const existing = snareFamilyByBeat.get(beatKey);
+      if (!existing) {
+        snareFamilyByBeat.set(beatKey, hit);
+      } else if (hit.velocity > existing.velocity) {
+        // Current hit wins — remove the previous lower-velocity entry
+        seen.delete(`${Math.round(existing.pitch)}_${existing.beat.toFixed(3)}`);
+        snareFamilyByBeat.set(beatKey, hit);
+      } else {
+        // Existing hit wins — drop the current one
+        seen.delete(key);
+      }
+    }
+
     for (const hit of seen.values()) {
       const clampedBeat = Math.max(0, Math.min(3.99, hit.beat));
       notes.push({
@@ -1631,6 +1654,14 @@ async function editClipCommand(
               "If a melody exists, leave breathing room — don't clutter every 16th note.",
               "Your drums must GROOVE WITH what's already there, not ignore it.",
               "",
+              "LAYERING RULE — never stack two snare-family hits at the exact same beat:",
+              "Snare family = any pad named snare, clap, rim, rimshot, snap, stick, ghost.",
+              "Placing snare (38) AND clap (39) both at beat 2.000 creates a doubled/phased",
+              "hit — two samples play simultaneously and stack unintentionally. Instead:",
+              "  (a) Use ONE snare-family hit per beat position (snare OR clap, not both), OR",
+              "  (b) Offset the secondary hit by exactly 0.01 beats for a tight slam effect",
+              "      (e.g. snare=2.000, clap=2.010). This gives layering without true stacking.",
+              "",
               "═══ PRODUCTION KNOWLEDGE (read and apply these skills) ═══",
               skills,
               "═════════════════════════════════════════════════════════",
@@ -1907,6 +1938,14 @@ async function generateClipCommand(
               "If a bassline exists: lock the kick drum to its root note hit positions.",
               "If a melody exists: leave space — don't put hi-hats on every note the melody plays.",
               "Your groove must feel INTENTIONALLY written for this specific session, not generic.",
+              "",
+              "LAYERING RULE — never stack two snare-family hits at the exact same beat:",
+              "Snare family = any pad named snare, clap, rim, rimshot, snap, stick, ghost.",
+              "Placing snare (38) AND clap (39) both at beat 2.000 creates a doubled/phased",
+              "hit — two samples play simultaneously and stack unintentionally. Instead:",
+              "  (a) Use ONE snare-family hit per beat position (snare OR clap, not both), OR",
+              "  (b) Offset the secondary hit by exactly 0.01 beats for a tight slam effect",
+              "      (e.g. snare=2.000, clap=2.010). This gives layering without true stacking.",
               "",
               "═══ PRODUCTION KNOWLEDGE (read and apply these skills) ═══",
               selectSkills({ role: "drums", prompt }),
@@ -2402,6 +2441,11 @@ async function fillClipSlotSelectionCommand(
                 content: [
                   "You are a professional drum programmer inside Ableton Live.",
                   "Define ONE base bar that repeats. Use variation_bars only for fills.",
+                  "",
+                  "LAYERING RULE — never stack two snare-family hits at the exact same beat:",
+                  "Snare family = any pad named snare, clap, rim, rimshot, snap, stick, ghost.",
+                  "Two snare-family sounds at the same beat (e.g. snare=2.000 AND clap=2.000)",
+                  "create a doubled/phased hit. Use ONE per beat, OR offset by 0.01 beats.",
                   "",
                   readDrumPadMap(parentTrack),
                 ].join("\n"),
