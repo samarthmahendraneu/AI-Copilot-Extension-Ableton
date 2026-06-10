@@ -486,9 +486,20 @@ function logTrackRouting(tag: string, track: MidiTrack<"1.0.0"> | undefined): vo
  *   ...
  * Falls back to the generic GM map if no DrumRack is found.
  */
+// Tracks the last pad map logged per track so the console shows the pad info
+// once per kit (and again whenever the kit changes), not on every prompt build.
+const lastLoggedPadMaps = new Map<string, string>();
+
 function readDrumPadMap(track: MidiTrack<"1.0.0">): string {
   const drumRack = findDrumRack(track.devices);
   if (!drumRack || drumRack.chains.length === 0) {
+    if (lastLoggedPadMaps.get(track.name) !== "GM_FALLBACK") {
+      lastLoggedPadMaps.set(track.name, "GM_FALLBACK");
+      console.warn(
+        `[AI Copilot] ⚠️ pad info → LLM for "${track.name}": no DrumRack found (or it has no pads) — ` +
+        `sending the GENERIC GM drum map. If this track has a kit, the LLM is guessing pitches blind.`,
+      );
+    }
     return GM_DRUM_MAP; // fallback
   }
 
@@ -510,7 +521,17 @@ function readDrumPadMap(track: MidiTrack<"1.0.0">): string {
   lines.push("");
   lines.push("When generating hits, always use the pitch numbers from this table above.");
 
-  return lines.join("\n");
+  const result = lines.join("\n");
+
+  // Log exactly what the LLM will see, deduped per track until the kit changes.
+  if (lastLoggedPadMaps.get(track.name) !== result) {
+    lastLoggedPadMaps.set(track.name, result);
+    console.log(
+      `[AI Copilot] pad info → LLM for "${track.name}" (${sorted.length} pads):\n${result}`,
+    );
+  }
+
+  return result;
 }
 
 /**
