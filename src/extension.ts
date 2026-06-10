@@ -1,5 +1,7 @@
 import * as https from "node:https";
 import * as http from "node:http";
+import * as fs from "node:fs";
+import * as zlib from "node:zlib";
 import {
   initialize,
   MidiClip,
@@ -1762,6 +1764,339 @@ function makeFetchUrlAgentTool(update: (label: string, pct?: number) => void): A
   };
 }
 
+// ─── Drum kit builder tools ──────────────────────────────────────────────────
+// Live's Core Library ships ~2,300 categorized one-shot drum samples. These
+// tools let the agent browse them and build a Drum Rack from scratch on an
+// empty track: insert rack → insert chain per pad → Simpler → load sample.
+
+/** Locate Live's Core Library folder (via the Extension Host path or common installs). */
+function getCoreLibraryDir(): string | null {
+  const candidates: string[] = [];
+  // Derive the .app bundle from the Extension Host path the user already configured.
+  const hostPath = process.env.EXTENSION_HOST_PATH ?? "";
+  const appMatch = hostPath.match(/^(.*\.app)\//);
+  if (appMatch) candidates.push(`${appMatch[1]}/Contents/App-Resources/Core Library`);
+  for (const app of ["Ableton Live 12 Suite", "Ableton Live 12 Beta", "Ableton Live 12 Standard"]) {
+    candidates.push(`/Applications/${app}.app/Contents/App-Resources/Core Library`);
+  }
+  for (const dir of candidates) {
+    try { if (fs.existsSync(dir)) return dir; } catch { /* fs may be restricted */ }
+  }
+  return null;
+}
+
+/** Locate the Core Library one-shot drum samples folder. */
+function getCoreDrumSamplesDir(): string | null {
+  if (process.env.DRUM_SAMPLES_DIR) {
+    try { if (fs.existsSync(process.env.DRUM_SAMPLES_DIR)) return process.env.DRUM_SAMPLES_DIR; } catch { /* ignore */ }
+  }
+  const core = getCoreLibraryDir();
+  if (!core) return null;
+  const dir = `${core}/Samples/One Shots/Drums`;
+  try { return fs.existsSync(dir) ? dir : null; } catch { return null; }
+}
+
+/** Locate the Core Library Drum Rack kit presets folder. */
+function getDrumKitsDir(): string | null {
+  const core = getCoreLibraryDir();
+  if (!core) return null;
+  const dir = `${core}/Racks/Drum Racks`;
+  try { return fs.existsSync(dir) ? dir : null; } catch { return null; }
+}
+
+const decodeXmlEntities = (s: string): string =>
+  s.replace(/&amp;/g, "&").replace(/&apos;/g, "'").replace(/&quot;/g, '"')
+   .replace(/&lt;/g, "<").replace(/&gt;/g, ">");
+
+interface KitPad { note: number; samplePath: string; label: string }
+
+/**
+ * Parse a Drum Rack preset (.adg = gzipped XML) into pad → sample mappings.
+ * Live stores each pad's ReceivingNote INVERTED (128 - midiNote). Sample paths
+ * reference Ableton's build machine — remapped onto the local Core Library.
+ * Synth-based pads (DS devices, Instrument Selectors) have no sample and are skipped.
+ */
+function parseDrumKitAdg(kitPath: string, coreLibDir: string): KitPad[] {
+  const xml = zlib.gunzipSync(fs.readFileSync(kitPath)).toString("utf8");
+  const pads: KitPad[] = [];
+  const seen = new Set<number>();
+
+  for (const block of xml.split("<DrumBranchPreset").slice(1)) {
+    const noteMatch = block.match(/<ReceivingNote Value="(\d+)"/);
+    const pathMatch = block.match(/Core Library\/(Samples\/[^"]*\.(?:wav|aif|aiff|flac))"/i);
+    if (!noteMatch || !pathMatch) continue;
+
+    const note = 128 - parseInt(noteMatch[1], 10);
+    if (note < 0 || note > 127 || seen.has(note)) continue;
+
+    const rel   = decodeXmlEntities(pathMatch[1]);
+    const local = `${coreLibDir}/${rel}`;
+    try { if (!fs.existsSync(local)) continue; } catch { continue; }
+
+    seen.add(note);
+    pads.push({ note, samplePath: local, label: rel.split("/").pop()!.replace(/\.[^.]+$/, "") });
+  }
+
+  return pads.sort((a, b) => a.note - b.note);
+}
+
+/**
+ * Load pads into the track's Drum Rack (inserting the rack first if missing):
+ * chain → receiving note → Simpler → sample. Returns per-pad result lines.
+ */
+async function buildPadsIntoRack(
+  track: MidiTrack<"1.0.0">,
+  pads: KitPad[],
+  update: (label: string, pct?: number) => void,
+): Promise<string[]> {
+  let drumRack = findDrumRack(track.devices);
+  if (!drumRack) {
+    update("Inserting Drum Rack…");
+    await track.insertDevice("Drum Rack", 0);
+    drumRack = findDrumRack(track.devices);
+    if (!drumRack) return ["FAILED: could not insert a Drum Rack on this track."];
+  }
+
+  const lines: string[] = [];
+  for (const pad of pads) {
+    try {
+      update(`Loading "${pad.label}" onto pad ${pad.note}…`);
+      const chain = await drumRack.insertChain(drumRack.chains.length) as DrumChain<"1.0.0">;
+      chain.receivingNote = Math.max(0, Math.min(127, Math.round(pad.note)));
+      const device = await chain.insertDevice("Simpler", 0);
+      if (device instanceof Simpler) {
+        await device.replaceSample(pad.samplePath);
+        lines.push(`Pad ${pad.note}: "${pad.label}"`);
+        console.log(`[AI Copilot] agent: pad ${pad.note} ← "${pad.label}" on "${track.name}"`);
+      } else {
+        lines.push(`FAILED pad ${pad.note}: inserted device is not a Simpler`);
+      }
+    } catch (e) {
+      lines.push(`FAILED pad ${pad.note}: ${(e as Error).message}`);
+      console.warn(`[AI Copilot] agent: kit pad ${pad.note} failed — ${(e as Error).message}`);
+    }
+  }
+  return lines;
+}
+
+const LIST_DRUM_KITS_TOOL: ToolDef = {
+  type: "function",
+  function: {
+    name: "list_drum_kits",
+    description:
+      "List Live's ready-made Drum Rack kit presets by category (Acoustic, Sampled, " +
+      "Electronic, Drum Machines…). Prefer loading one of these with load_drum_kit over " +
+      "building a kit sample-by-sample — they are professionally curated and genre-tagged " +
+      "by name. Sample-based kits (Acoustic, Sampled, Drum Machines) load most reliably.",
+    strict: true,
+    parameters: { type: "object", additionalProperties: false, required: [], properties: {} },
+  },
+};
+
+const LOAD_DRUM_KIT_TOOL: ToolDef = {
+  type: "function",
+  function: {
+    name: "load_drum_kit",
+    description:
+      "Load an existing Drum Rack kit preset onto the track by name (from list_drum_kits). " +
+      "Recreates the kit's pads with their original samples and returns the resulting pad map — " +
+      "use those exact pitches in create_drum_clip. If a kit loads very few pads (synth-based " +
+      "kits cannot be recreated), try a different kit or build one with create_drum_kit.",
+    strict: true,
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      required: ["kit_name", "reasoning"],
+      properties: {
+        kit_name:  { type: "string", description: "Kit name from list_drum_kits, e.g. \"Crystal Clear Kit\"" },
+        reasoning: { type: "string", description: "Why this kit fits the requested style" },
+      },
+    },
+  },
+};
+
+const LIST_DRUM_SAMPLES_TOOL: ToolDef = {
+  type: "function",
+  function: {
+    name: "list_drum_samples",
+    description:
+      "Browse Live's Core Library one-shot drum samples. Categories: Kick, Snare, Clap, " +
+      "Rim, Hihat, Cymbal, Ride, Tom, Shaker, Tambourine, Bongo, Conga, Timbales, Bell, " +
+      "Wood, Electronic Percussion, Misc Percussion, FX Hit. " +
+      "Returns sample file names to use with create_drum_kit. " +
+      "Use filter to narrow by name (e.g. '808', 'Soft', 'Vinyl'); pass \"\" for all.",
+    strict: true,
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      required: ["category", "filter"],
+      properties: {
+        category: { type: "string", description: "One category, e.g. \"Kick\"" },
+        filter:   { type: "string", description: "Case-insensitive name substring, or \"\" for all" },
+      },
+    },
+  },
+};
+
+const CREATE_DRUM_KIT_TOOL: ToolDef = {
+  type: "function",
+  function: {
+    name: "create_drum_kit",
+    description:
+      "Build a Drum Rack on the track from Core Library samples (inserts the rack if missing). " +
+      "Each pad needs: receiving_note (the MIDI pitch that triggers it), the sample's category, " +
+      "and its exact file name from list_drum_samples. " +
+      "Use GM pitches so patterns map cleanly: 36=Kick, 37=Rim, 38=Snare, 39=Clap, " +
+      "42=Closed Hihat, 46=Open Hihat, 49=Crash Cymbal, 51=Ride, 41/45/47/48=Toms, " +
+      "54=Tambourine, 70=Shaker. Typical kit: kick, snare, clap, closed hat, open hat + 1-3 extras. " +
+      "Returns the new pad map — use those pitches in create_drum_clip afterwards.",
+    strict: true,
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      required: ["pads", "reasoning"],
+      properties: {
+        pads: {
+          type: "array",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            required: ["receiving_note", "category", "sample_file"],
+            properties: {
+              receiving_note: { type: "number", description: "MIDI pitch that triggers this pad (e.g. 36 for kick)" },
+              category:       { type: "string", description: "Sample category, e.g. \"Kick\"" },
+              sample_file:    { type: "string", description: "Exact file name from list_drum_samples" },
+            },
+          },
+        },
+        reasoning: { type: "string", description: "Why these samples fit the requested style" },
+      },
+    },
+  },
+};
+
+/** Kit-building tools (browse samples / build Drum Rack) bound to one track. */
+function makeDrumKitAgentTools(
+  track: MidiTrack<"1.0.0">,
+  update: (label: string, pct?: number) => void,
+): AgentTool[] {
+  return [
+    {
+      def: LIST_DRUM_SAMPLES_TOOL,
+      handler: async (args) => {
+        const { category, filter } = args as { category: string; filter: string };
+        const root = getCoreDrumSamplesDir();
+        if (!root) return "FAILED: Core Library drum samples not found on this machine. Skip kit building.";
+        const dirs = fs.readdirSync(root, { withFileTypes: true }).filter((d) => d.isDirectory());
+        const dir  = dirs.find((d) => d.name.toLowerCase() === category.trim().toLowerCase());
+        if (!dir) return `Unknown category "${category}". Available: ${dirs.map((d) => d.name).join(", ")}`;
+        const all = fs.readdirSync(`${root}/${dir.name}`)
+          .filter((f) => /\.(wav|aif|aiff|flac)$/i.test(f))
+          .filter((f) => !filter || f.toLowerCase().includes(filter.toLowerCase()));
+        const shown = all.slice(0, 80);
+        return [
+          `${all.length} sample(s) in "${dir.name}"${filter ? ` matching "${filter}"` : ""}:`,
+          ...shown.map((f) => `  ${f}`),
+          all.length > shown.length ? `  …and ${all.length - shown.length} more — narrow with filter.` : "",
+        ].join("\n");
+      },
+    },
+    {
+      def: LIST_DRUM_KITS_TOOL,
+      handler: async () => {
+        const root = getDrumKitsDir();
+        if (!root) return "FAILED: Core Library drum kits not found on this machine. Build a kit with create_drum_kit instead.";
+        const lines: string[] = [];
+        const cats = fs.readdirSync(root, { withFileTypes: true }).filter((d) => d.isDirectory());
+        for (const cat of cats) {
+          const kits = fs.readdirSync(`${root}/${cat.name}`).filter((f) => f.endsWith(".adg"));
+          if (kits.length === 0) continue;
+          lines.push(`${cat.name}:`);
+          for (const kit of kits) lines.push(`  ${kit.replace(/\.adg$/, "")}`);
+        }
+        return lines.length > 0 ? lines.join("\n") : "No kit presets found.";
+      },
+    },
+    {
+      def: LOAD_DRUM_KIT_TOOL,
+      handler: async (args) => {
+        const { kit_name, reasoning } = args as { kit_name: string; reasoning: string };
+        const root    = getDrumKitsDir();
+        const coreLib = getCoreLibraryDir();
+        if (!root || !coreLib) return "FAILED: Core Library not found on this machine.";
+
+        // Find the .adg by name (case-insensitive, any category subfolder)
+        const wanted = kit_name.trim().toLowerCase().replace(/\.adg$/, "");
+        let kitPath: string | null = null;
+        for (const cat of fs.readdirSync(root, { withFileTypes: true }).filter((d) => d.isDirectory())) {
+          const hit = fs.readdirSync(`${root}/${cat.name}`)
+            .find((f) => f.endsWith(".adg") && f.replace(/\.adg$/, "").toLowerCase() === wanted);
+          if (hit) { kitPath = `${root}/${cat.name}/${hit}`; break; }
+        }
+        if (!kitPath) return `Kit "${kit_name}" not found — call list_drum_kits for exact names.`;
+
+        update(`Parsing "${kit_name}"…`);
+        const pads = parseDrumKitAdg(kitPath, coreLib);
+        if (pads.length === 0) {
+          return `Kit "${kit_name}" contains no loadable sample pads (likely a synth-based kit). ` +
+                 "Try a kit from the Acoustic or Sampled category, or build one with create_drum_kit.";
+        }
+
+        const lines = await buildPadsIntoRack(track, pads, update);
+        const ok    = lines.filter((l) => !l.startsWith("FAILED")).length;
+        console.log(`[AI Copilot] agent: loaded kit "${kit_name}" on "${track.name}" (${ok}/${pads.length} pads). Reason: ${reasoning}`);
+        return [
+          `Loaded kit "${kit_name}" (${ok}/${pads.length} pads):`,
+          ...lines,
+          "",
+          readDrumPadMap(track),
+          "Use these exact pitches in create_drum_clip.",
+        ].join("\n");
+      },
+    },
+    {
+      def: CREATE_DRUM_KIT_TOOL,
+      handler: async (args) => {
+        const input = args as unknown as {
+          pads: Array<{ receiving_note: number; category: string; sample_file: string }>;
+          reasoning: string;
+        };
+        const root = getCoreDrumSamplesDir();
+        if (!root) return "FAILED: Core Library drum samples not found on this machine.";
+
+        // Resolve category + file name → absolute sample paths
+        const resolved: KitPad[] = [];
+        const lines: string[] = [];
+        for (const pad of input.pads) {
+          const dirs   = fs.readdirSync(root, { withFileTypes: true }).filter((d) => d.isDirectory());
+          const catDir = dirs.find((d) => d.name.toLowerCase() === pad.category.trim().toLowerCase());
+          if (!catDir) { lines.push(`FAILED pad ${pad.receiving_note}: unknown category "${pad.category}"`); continue; }
+          const files = fs.readdirSync(`${root}/${catDir.name}`);
+          const file  = files.find((f) => f.toLowerCase() === pad.sample_file.trim().toLowerCase())
+                     ?? files.find((f) => f.toLowerCase().includes(pad.sample_file.trim().toLowerCase()) && !f.endsWith(".asd"));
+          if (!file) { lines.push(`FAILED pad ${pad.receiving_note}: sample "${pad.sample_file}" not found in ${catDir.name}`); continue; }
+          resolved.push({
+            note:       pad.receiving_note,
+            samplePath: `${root}/${catDir.name}/${file}`,
+            label:      file.replace(/\.[^.]+$/, ""),
+          });
+        }
+
+        lines.push(...await buildPadsIntoRack(track, resolved, update));
+        const ok = lines.filter((l) => !l.startsWith("FAILED")).length;
+        console.log(`[AI Copilot] agent: built drum kit on "${track.name}" (${ok}/${input.pads.length} pads). Reason: ${input.reasoning}`);
+        return [
+          `Drum kit built (${ok}/${input.pads.length} pads loaded):`,
+          ...lines,
+          "",
+          readDrumPadMap(track),
+          "Use these exact pitches in create_drum_clip.",
+        ].join("\n");
+      },
+    },
+  ];
+}
+
 // ─── Command: Sound design on a single device (Simpler / DrumRack scope) ──────
 
 async function soundDesignCommand(
@@ -1898,9 +2233,9 @@ async function soundDesignTrackCommand(
   const song  = context.application.song!;
   const track = context.getObjectFromHandle(arg as Handle, MidiTrack);
 
+  // An empty chain is fine — the model can insert the devices it needs.
   if (track.devices.length === 0) {
-    console.warn("[AI Copilot] soundDesignTrack: no devices on this track.");
-    return;
+    console.log("[AI Copilot] soundDesignTrack: empty device chain — the AI will insert devices as needed.");
   }
 
   const rawResult = await context.ui.showModalDialog(
@@ -2301,8 +2636,14 @@ async function generateClipCommand(
     update("Reading session…", 15);
 
     const sessionCtx = buildSessionContext(song);
-    const drumMode   = isDrumTrack(track);
+    // Empty track + drum-flavoured prompt → drum branch, where the agent can
+    // build a kit from Core Library samples before writing the pattern.
+    const drumIntent = /\bdrum|beat\b|kick|snare|hi.?hat|\bhat\b|percussion|groove|\b808\b|drum.?kit/i.test(prompt);
+    const drumMode   = isDrumTrack(track) || (track.devices.length === 0 && drumIntent);
     logTrackRouting("generateClip", track);
+    if (drumMode && track.devices.length === 0) {
+      console.log(`[AI Copilot] generateClip: empty track + drum-intent prompt → drum branch (agent may build a kit).`);
+    }
 
     // For a new clip we default to placing at beat 0 for 16 beats (4 bars) —
     // the AI may override startTime in its tool call. Use that range for sibling context.
@@ -2420,6 +2761,7 @@ async function generateClipCommand(
         onProgress: (l) => update(l, 45),
         tools: [
           createDrumClipAgentTool,
+          ...makeDrumKitAgentTools(track, update),
           ...makeDeviceAgentTools(track, update),
           makeFetchUrlAgentTool(update),
         ],
@@ -2429,12 +2771,18 @@ async function generateClipCommand(
             content: [
               "You are a professional drum programmer and mix engineer agent inside Ableton Live.",
               "Fulfill the user's ENTIRE request step by step using your tools:",
-              "• create_drum_clip — write the MIDI pattern (usually the first step)",
+              "• list_drum_kits / load_drum_kit — load one of Live's ready-made kits",
+              "• list_drum_samples / create_drum_kit — or build a custom kit sample-by-sample",
+              "  (a kit step is REQUIRED FIRST if the track has no Drum Rack — check the pad map",
+              "   below: if it is the generic GM fallback, get a kit that fits the requested genre.",
+              "   Prefer load_drum_kit; build a custom kit when the user asks for specific sounds",
+              "   or no preset fits. Then use the returned pad pitches for the pattern.)",
+              "• create_drum_clip — write the MIDI pattern",
               "• read_device_params / insert_devices / set_device_params — device & FX work",
               "  (e.g. 'add glue and saturation' → insert Glue Compressor + Saturator, then configure)",
               "• fetch_url — research references the user points you to",
-              "Work in order: MIDI first, then devices. When EVERYTHING the user asked for is done,",
-              "reply with a one-paragraph text summary and NO further tool calls.",
+              "Work in order: kit (if needed) → MIDI → devices. When EVERYTHING the user asked for",
+              "is done, reply with a one-paragraph text summary and NO further tool calls.",
               "If the request is only about MIDI, do not touch devices.",
               "",
               "Use create_drum_clip with ONE base bar that repeats perfectly every bar.",
