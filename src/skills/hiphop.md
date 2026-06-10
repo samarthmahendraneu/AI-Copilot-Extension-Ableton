@@ -1,4 +1,6 @@
-# Hip-Hop / Boom Bap / Trap Skill
+# Hip-Hop / Boom Bap / Trap Reference
+
+Genre conventions — adapt to the user's prompt; these are starting points, not rules.
 
 ## Tempo feel
 - Boom bap: 80–95 BPM. Trap: 130–150 BPM (but the half-time feel = 65–75).
@@ -6,29 +8,29 @@
 
 ## Boom bap drums
 - Kick: beat 0.0, and a syncopated second kick around 1.5 or 2.5 (the "boom-bap").
-- Snare: HARD on beat 1.0 and 3.0 (the "bap"). Slightly behind the grid (+0.02) for laid-back feel.
+- Snare: hard on beat 1.0 and 3.0 (the "bap"). Slightly behind the grid (+0.02) for a laid-back feel.
 - Hats: straight 8ths or swung 16ths, velocity 60–85, never robotic.
-- Swing: 55–62% — this is the soul of boom bap. Off-beat 16ths land late.
+- Swing: 55–62% — this is what gives boom bap its soul. Off-beat 16ths land late.
 
 ## Trap drums
-- Kick: syncopated, follows the 808 bassline exactly (they are one instrument).
-- Snare/clap: beat 1.0 and 3.0, often with a layered clap.
-- Hats: the signature. Fast rolls — 1/16, 1/32, triplet bursts. Velocity ramps.
-  - Roll example on beat 3: hats at 3.0, 3.125, 3.25, 3.375 with rising velocity 70→110.
-- 808: the kick and bass ARE the same note. Tune the 808 to the song key.
+- Kick: syncopated, often follows the 808 bassline.
+- Snare/clap: beat 1.0 and 3.0 — hard backbeat.
+- Hats: fast rolls are the signature — 1/16, 1/32, triplet bursts with velocity ramps.
+  - Example roll on beat 3: hats at 3.0, 3.125, 3.25, 3.375 with rising velocity 70→110.
+- 808: the kick and bass are often the same note. Tuning the 808 to the song key helps.
 
 ## Melody / sampling aesthetic
 - Minor keys dominate (natural minor, harmonic minor, Dorian, Phrygian).
 - Jazzy 7th and 9th chords (Cmin7, Fmin9, etc.). Soulful, slightly detuned.
-- Melodies are SPARSE and emotional — 3–5 notes per bar, lots of space.
-- Use the "call and response": a phrase, then silence, then an answer.
+- Melodies tend to be sparse and emotional — 3–5 notes per bar, lots of space.
+- "Call and response": a phrase, then silence, then an answer.
 
-## Velocity / humanization for hip hop
-- Heavy swing and "drunk" timing — nudge notes ±0.02–0.04 off the grid.
-- Velocity should breathe: a melody note might be 65, the next 88, the next 52.
-- This genre LIVES on imperfection. Quantize-tight = wrong.
+## Velocity / humanization
+- Swing and "drunk" timing are central to the feel — nudging notes ±0.02–0.04 off the grid.
+- Velocity should breathe: a melody note at 65, the next at 88, the next at 52.
+- Tight quantization tends to lose the genre feel; natural imperfection is the goal.
 
 ## Bass (808 / sub)
 - Long, gliding notes. One root note per chord, held 1–2 beats.
-- Lock the FIRST 808 hit to the kick on beat 0.0.
+- The first 808 hit typically aligns with the kick on beat 0.0.
 - Slide/portamento between notes (in MIDI: notes that nearly touch, slight overlap).
