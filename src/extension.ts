@@ -1580,9 +1580,13 @@ const INSERT_DEVICES_TOOL: ToolDef = {
       "Insert built-in Ableton Live devices into the track's device chain. " +
       "Use this when the requested sound needs a device that is NOT in the chain yet " +
       "(e.g. 'add a low cut' → insert EQ Eight; 'glue it together' → insert Glue Compressor). " +
-      "Only Live's native devices work. Exact names include: EQ Eight, EQ Three, Compressor, " +
-      "Glue Compressor, Saturator, Reverb, Delay, Echo, Auto Filter, Auto Pan, Utility, " +
-      "Chorus-Ensemble, Phaser-Flanger, Redux, Drum Buss, Limiter, Multiband Dynamics, Gate. " +
+      "Only Live's native devices work, always with their DEFAULT preset. " +
+      "FX names include: EQ Eight, EQ Three, Compressor, Glue Compressor, Saturator, Reverb, " +
+      "Delay, Echo, Auto Filter, Auto Pan, Utility, Chorus-Ensemble, Phaser-Flanger, Redux, " +
+      "Drum Buss, Limiter, Multiband Dynamics, Gate. " +
+      "INSTRUMENT names (use index 0, for tracks with no sound source): Wavetable, Operator, " +
+      "Drift, Analog, Electric, Collision, Meld, Simpler, Sampler, Drum Rack. Instruments load " +
+      "in init state — sound-design them with set_device_params to fit the request. " +
       "After inserting, you receive the new devices' full parameter lists — " +
       "THEN call set_device_params to configure them. Insert first, configure second.",
     strict: true,
@@ -2925,8 +2929,11 @@ async function generateClipCommand(
               "• read_device_params / insert_devices / set_device_params — device & FX work",
               "  (e.g. 'add reverb and a low cut' → insert Reverb + EQ Eight, then configure)",
               "• fetch_url — research references the user points you to",
-              "Work in order: MIDI first, then devices. When EVERYTHING the user asked for is done,",
-              "reply with a one-paragraph text summary and NO further tool calls.",
+              "If the track has NO instrument (empty device chain), the clip will be silent —",
+              "insert one first (Drift or Wavetable for synths/pads, Electric for keys, Operator",
+              "for FM/bells) and sound-design it with set_device_params to fit the request.",
+              "Work in order: instrument (if needed) → MIDI → FX. When EVERYTHING the user asked",
+              "for is done, reply with a one-paragraph text summary and NO further tool calls.",
               "If the request is only about MIDI, do not touch devices.",
               "",
               "CRITICAL: Read the existing arrangement content shown below BEFORE writing any notes.",
