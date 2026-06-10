@@ -13,6 +13,9 @@ to what the user's prompt asks for.
 ## MIDI pitch reference
 - 60 = C3 (Ableton) / Middle C. 12 semitones per octave.
 - Bass usually lives 28–48 (E0–C2). Melody 60–84 (C3–C5). Pads 48–72.
+- DRUM TRACKS ARE DIFFERENT: on a drum track, pitch numbers are pad addresses
+  that select which sound plays (36 = kick pad, 38 = snare pad…). They have no
+  harmonic meaning — key and scale never apply to drum pitches.
 
 ## Velocity = emotion
 - Flat velocity sounds robotic. Humans vary their touch naturally.
@@ -34,4 +37,4 @@ to what the user's prompt asks for.
 2. Does velocity vary naturally between neighbouring hits?
 3. Does the kick align with the bass root?
 4. Is the backbeat (snare) consistent and clear?
-5. Are all notes in the right key?
+5. Melodic notes only: are they in key? (Key/scale NEVER applies to drum pads.)

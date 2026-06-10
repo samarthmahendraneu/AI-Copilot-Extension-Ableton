@@ -401,6 +401,18 @@ Standard MIDI drum pitches (General MIDI + common Ableton defaults):
 Use these unless you can see different pitches in the existing clip notes.
 `;
 
+// Injected into every drum system prompt. Without this, the model has been
+// observed snapping drum pitches to the song's scale ("kick C, snare D, clap E…"),
+// which lands hits on arbitrary pads instead of the right sounds.
+const DRUM_PITCH_RULE = [
+  "CRITICAL — DRUM PITCHES ARE PAD ADDRESSES, NOT MUSICAL NOTES:",
+  "On a drum track, the MIDI pitch number only selects WHICH PAD (sound) plays.",
+  "It has zero harmonic meaning. Key, scale, and Scale Mode NEVER apply to drums.",
+  "Ignore the Key/Scale line in the session overview when writing drum patterns.",
+  "Choose pads by their NAME in the pad map (kick, snare, hat…) — never by pitch class.",
+  "Snapping drum pitches to a scale puts hits on wrong or empty pads and ruins the beat.",
+].join("\n");
+
 interface DrumHit {
   pitch:    number; // MIDI pitch
   beat:     number; // position within the bar in beats (0.0–3.99)
@@ -453,6 +465,79 @@ function readDrumPadMap(track: MidiTrack<"1.0.0">): string {
   lines.push("When generating hits, always use the pitch numbers from this table above.");
 
   return lines.join("\n");
+}
+
+/**
+ * Diagnostic logging for every drum generation. Logs the model's reasoning,
+ * which pads each pitch actually lands on, and — most importantly — warns
+ * loudly when a generated pitch has NO pad in the DrumRack (the hit will be
+ * silent or land on an unintended sound). This is how we catch failures like
+ * the model snapping drum pitches to the song's scale.
+ */
+function logDrumPadUsage(
+  tag: string,
+  pitches: number[],
+  track?: MidiTrack<"1.0.0">,
+  extraLines: string[] = [],
+): void {
+  // Build pitch → pad-name map from the track's DrumRack (if present)
+  const padNames = new Map<number, string>();
+  const drumRack = track?.devices.find((d) => d instanceof DrumRack);
+  if (drumRack instanceof DrumRack) {
+    for (const chain of drumRack.chains) {
+      const label = (((chain as unknown) as { name?: string }).name ?? "").trim();
+      padNames.set(chain.receivingNote, label || "(unnamed pad)");
+    }
+  }
+
+  const counts = new Map<number, number>();
+  for (const pitch of pitches) {
+    const p = Math.round(pitch);
+    counts.set(p, (counts.get(p) ?? 0) + 1);
+  }
+
+  const lines: string[] = [`[AI Copilot] ${tag} — drum generation diagnostics:`];
+  lines.push(...extraLines);
+  lines.push("  Pad usage:");
+
+  const unknownPitches: number[] = [];
+  for (const [pitch, count] of [...counts].sort((a, b) => a[0] - b[0])) {
+    if (padNames.size > 0) {
+      const pad = padNames.get(pitch);
+      if (pad) {
+        lines.push(`    ${pitch} (${pitchToName(pitch)}) → "${pad}" ×${count}`);
+      } else {
+        lines.push(`    ${pitch} (${pitchToName(pitch)}) → ⚠️ NO PAD AT THIS PITCH ×${count}`);
+        unknownPitches.push(pitch);
+      }
+    } else {
+      lines.push(`    ${pitch} (${pitchToName(pitch)}) ×${count} (no DrumRack to verify against)`);
+    }
+  }
+  console.log(lines.join("\n"));
+
+  if (unknownPitches.length > 0) {
+    console.warn(
+      `[AI Copilot] ⚠️ ${tag}: ${unknownPitches.length} pitch(es) [${unknownPitches.join(", ")}] ` +
+      `have NO pad in the DrumRack — those hits are silent or wrong. ` +
+      `This usually means the model ignored the pad map (e.g. snapped drum pitches to the song scale).`,
+    );
+  }
+}
+
+function logDrumGeneration(
+  tag: string,
+  result: DrumPatternResult,
+  track?: MidiTrack<"1.0.0">,
+): void {
+  const allHits = [
+    ...result.base_pattern.hits,
+    ...result.variation_bars.flatMap((v) => v.hits),
+  ];
+  const extra: string[] = [];
+  if (result.reasoning) extra.push(`  Model reasoning: ${result.reasoning}`);
+  extra.push(`  Base hits: ${result.base_pattern.hits.length}, variation bars: ${result.variation_bars.length}`);
+  logDrumPadUsage(tag, allHits.map((h) => h.pitch), track, extra);
 }
 
 /**
@@ -926,6 +1011,9 @@ function buildScaleConstraint(
     `║  In-key notes : ${scaleNotes}`,
     `║  ⚠️  Use ONLY these pitch classes (any octave).`,
     `║     All other pitches are OUT OF KEY — do not use them.`,
+    `║  ⚠️  MELODIC CONTENT ONLY: this constraint applies to melody,`,
+    `║     bass, and chords. It NEVER applies to drum tracks — drum`,
+    `║     pitches are pad addresses with no harmonic meaning.`,
     "╚══════════════════════════════════════════════════════════",
     "",
   ].join("\n");
@@ -1651,6 +1739,8 @@ async function editClipCommand(
               "This guarantees consistency — kicks and snares will be in the same position every bar.",
               "Only use variation_bars for fills (typically the last bar of a 4-bar phrase) or crashes.",
               "",
+              DRUM_PITCH_RULE,
+              "",
               "CRITICAL: Read the existing arrangement content below BEFORE writing any pattern.",
               "If a bass line exists, lock the kick drum to its root note hits.",
               "If a melody exists, leave breathing room — don't clutter every 16th note.",
@@ -1712,11 +1802,7 @@ async function editClipCommand(
             const result   = args as DrumPatternResult;
             clip.notes     = expandDrumPattern(result, clip.duration);
             clip.color     = CLIP_COLORS.drums;
-            console.log(
-              `[AI Copilot] set_drum_pattern → ${clip.notes.length} notes across ${totalBars} bars.\n` +
-              `  Base hits: ${result.base_pattern.hits.length}  Variation bars: ${result.variation_bars.length}\n` +
-              `  Reasoning: ${result.reasoning}`,
-            );
+            logDrumGeneration(`editClip (${clip.notes.length} notes, ${totalBars} bars)`, result, parentTrack);
           }
           if (call.function.name === "rename_clip") {
             clip.name = args.name as string;
@@ -1936,6 +2022,8 @@ async function generateClipCommand(
               "This guarantees kick/snare lock — no drift across bars.",
               "Only override via variation_bars for fills on bar 4, 8, etc.",
               "",
+              DRUM_PITCH_RULE,
+              "",
               "CRITICAL: Read the existing arrangement content carefully BEFORE writing any pattern.",
               "If a bassline exists: lock the kick drum to its root note hit positions.",
               "If a melody exists: leave space — don't put hi-hats on every note the melody plays.",
@@ -2002,11 +2090,10 @@ async function generateClipCommand(
         clip.name   = input.clipName;
         clip.notes  = expandDrumPattern(patternResult, input.duration);
         clip.color  = CLIP_COLORS.drums;
-        console.log(
-          `[AI Copilot] Created drum clip "${input.clipName}" ` +
-          `(${clip.notes.length} notes, ${input.duration} beats, ${Math.round(input.duration / 4)} bars).\n` +
-          `  Base hits: ${input.base_pattern.hits.length}  Variations: ${input.variation_bars.length}\n` +
-          `  Reasoning: ${input.reasoning}`,
+        logDrumGeneration(
+          `generateClip "${input.clipName}" (${clip.notes.length} notes, ${Math.round(input.duration / 4)} bars)`,
+          patternResult,
+          track,
         );
       }
 
@@ -2297,6 +2384,8 @@ async function fillArrangementSelectionCommand(
               "Each track gets its own clip. Parts must be complementary — do not double every track.",
               "Match each track's musical role (bass stays low, melody stays sparse, etc.).",
               "",
+              DRUM_PITCH_RULE,
+              "",
               MELODY_RULES,
               scaleConstraint,
             ].join("\n"),
@@ -2313,6 +2402,11 @@ async function fillArrangementSelectionCommand(
               trackSummary,
               "╚══════════════════════════════════════════════════════════",
               "",
+              // Pad maps for every drum track in the selection — without these the
+              // model has no idea which pitches map to which sounds.
+              ...tracks.filter(isDrumTrack).map(
+                (t) => `Drum track "${t.name}" pad map:\n${readDrumPadMap(t)}\n`,
+              ),
               `USER REQUEST: "${prompt}"`,
               "",
               "Generate one cohesive part per track. All parts must work together.",
@@ -2366,6 +2460,14 @@ async function fillArrangementSelectionCommand(
             `[AI Copilot] fillArrangement → "${track.name}": clip "${entry.clip_name}" ` +
             `(${validatedNotes.length} notes, ${totalBars} bars)  [${report}]\n  ${entry.phrase_plan}`,
           );
+          if (drumTrack) {
+            logDrumPadUsage(
+              `fillArrangement "${entry.clip_name}" on "${track.name}"`,
+              validatedNotes.map((n) => n.pitch),
+              track,
+              [`  Phrase plan: ${entry.phrase_plan}`],
+            );
+          }
         }
 
         console.log(`[AI Copilot] fillArrangement reasoning: ${result.reasoning}`);
@@ -2444,6 +2546,8 @@ async function fillClipSlotSelectionCommand(
                   "You are a professional drum programmer inside Ableton Live.",
                   "Define ONE base bar that repeats. Use variation_bars only for fills.",
                   "",
+                  DRUM_PITCH_RULE,
+                  "",
                   "LAYERING RULE — never stack two snare-family hits at the exact same beat:",
                   "Snare family = any pad named snare, clap, rim, rimshot, snap, stick, ghost.",
                   "Two snare-family sounds at the same beat (e.g. snare=2.000 AND clap=2.000)",
@@ -2475,6 +2579,7 @@ async function fillClipSlotSelectionCommand(
             const clip       = await slot.createMidiClip(clipLength);
             clip.notes       = expandDrumPattern(result, clipLength);
             clip.color       = CLIP_COLORS.drums;
+            logDrumGeneration(`fillClipSlot on "${trackName}" (${clip.notes.length} notes)`, result, parentTrack);
           }
 
         } else {
@@ -2919,6 +3024,8 @@ async function buildArrangementCommand(
             "Melody/bass tracks use notes + phrase_plan. Keep melodies sparse and sectional.",
             "Clips in different sections on the same track should have different names and vary musically.",
             "",
+            DRUM_PITCH_RULE,
+            "",
             MELODY_RULES,
             scaleConstraint,
           ].join("\n"),
@@ -2999,6 +3106,7 @@ async function buildArrangementCommand(
           };
           clip.notes = expandDrumPattern(patternResult, entry.duration_beats);
           clip.color = CLIP_COLORS.drums;
+          logDrumGeneration(`buildArrangement "${entry.clip_name}" (${clip.notes.length} notes)`, patternResult, track);
         } else if (entry.notes && entry.notes.length > 0) {
           // Run full validator pipeline — scale snap, density clamp, gaps, velocity humanize.
           const { notes: validated, report } = runMelodyValidators(entry.notes as NoteDescription[], song);
